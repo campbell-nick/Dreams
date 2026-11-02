@@ -1,9 +1,9 @@
 # Illution (illus)
 
+A lightweight, stateless C package manager designed to build and install software directly into user space (`~/.local/`) while supporting elevated execution via `sudo`.
+
 ## WARNING (Use at your own risk)
 This is project is currently being worked on. You may face bugs or issues. Feel free to contact me if you face any issues.
-
-A lightweight, stateless C package manager designed to build and install software directly into user space (`~/.local/`) while supporting elevated execution via `sudo`.
 
 ## Features
 
