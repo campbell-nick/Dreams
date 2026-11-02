@@ -18,6 +18,11 @@ First clone the repo:
 ```bash
 git clone https://github.com/campbell-nick/Illution.git
 ```
+To build and install `illus` locally to `~/.local/bin`:
+```bash
+make
+make install
+```
 
 To build and install `illus` system-wide to `/usr/local/bin`:
 
