@@ -9,7 +9,6 @@
 #include "commands.h"
 
 // Helper function to get the real user's home directory (even under sudo)
-// Helper function to get the real user's home directory (even under sudo)
 static char* get_real_home() {
     const char *sudo_user = getenv("SUDO_USER");
     if (sudo_user) {
@@ -34,7 +33,7 @@ static char* get_real_home() {
     }
     return NULL;
 }
-// --- 1. Pull Command: Clones into ~/Dreams and saves state ---
+// Pull Command
 void cmd_pull(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "[Dreams] Usage: illus --pull <repository_url> [--dir <path>]\n");
@@ -50,7 +49,7 @@ void cmd_pull(int argc, char *argv[]) {
         return;
     }
 
-    // Extract repository name from URL (e.g., ".../mytool.git" -> "mytool")
+    // Extract repository name from Url
     const char *last_slash = strrchr(url, '/');
     if (!last_slash) {
         fprintf(stderr, "[Dreams] Error: Invalid repository URL format.\n");
@@ -115,7 +114,7 @@ void cmd_pull(int argc, char *argv[]) {
     free(home);
 }
 
-// --- 2. Cast Command: Handles building, cleaning (--fresh), and storing (--store) ---
+// Cast Command
 void cmd_cast(int store, int fresh) {
     char *home = get_real_home();
     if (!home) {
@@ -164,13 +163,13 @@ void cmd_cast(int store, int fresh) {
         snprintf(install_cmd, sizeof(install_cmd), "cd \"%s\" && make PREFIX=\"%s/.local\" install", workspace, home);
     }
 
-    // Execute Clean / Fresh if requested
+    // Execute Clean if requested
     if (fresh) {
         printf("[Dreams] Sweeping clean build artifacts (--fresh)...\n");
         system(clean_cmd);
     }
 
-    // Execute Build (Cast)
+    // Execute Build
     printf("[Dreams] Casting spell... building project...\n");
     int build_status = system(build_cmd);
     if (build_status != 0) {
@@ -180,7 +179,7 @@ void cmd_cast(int store, int fresh) {
     }
     printf("[Dreams] Build successful!\n");
 
-    // Execute Store / Install if requested
+    // Execute Install if requested
     if (store) {
         printf("[Dreams] Storing binary to %s/.local/bin/ (--store)...\n", home);
         int install_status = system(install_cmd);
@@ -191,7 +190,7 @@ void cmd_cast(int store, int fresh) {
         }
         printf("[Dreams] Successfully stored and installed package!\n");
 
-        // Write Manifest file for uninstall tracker (--shed)
+        // Write Manifest file for uninstall tracker
         char *repo_name = strrchr(workspace, '/');
         if (repo_name) {
             repo_name++;
@@ -299,7 +298,7 @@ void cmd_update(void) {
     free(home);
 }
 
-// --- 5. Version Command: Displays ASCII logo and version information ---
+// Version Command
 void cmd_version() {
     printf("\033[36m");
     printf("  ___ _ _            \n");
@@ -311,7 +310,7 @@ void cmd_version() {
     printf(" ✦ Dreams Package Manager (illus) v1.0.0✦\n");
 }
 
-// --- 3. Shed Command: Uninstalls the package using its manifest ---
+// Shed Command
 void cmd_shed(const char *package_name) {
     printf("[Dreams] Shedding (uninstalling) package: %s\n", package_name);
 
