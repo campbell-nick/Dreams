@@ -14,7 +14,7 @@ This is project is still in development. You may face bugs or issues. Feel free 
 - **Build System Detection**: Auto-detects `Makefile` and `CMakeLists.txt` build systems with prefix injection.
 - **Manifest Tracking**: Automatically tracks installed files for straightforward management.
 
-## Building & Installing `illus`
+## Building & Installing `Dreams`
 
 First clone the repo:
 ```bash
@@ -37,3 +37,18 @@ sudo make install
 
 ```bash
 sudo make uninstall
+```
+
+## Usage of Dreams.
+
+### Cloning repos:
+```bash
+illus --pull {URL}
+```
+
+This will clone to the ~/Dreams folder by default. If you want to clone into your custom directory, you can use the --dir flag.
+
+```bash
+illus --pull {URL} --dir ~/Your/Directory
+```
+
