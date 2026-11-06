@@ -1,23 +1,29 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O3
+CFLAGS = -Wall -Wextra -std=c99 -O2
 TARGET = illus
-PREFIX ?= $(HOME)/.local
-SRC = main.c commands.c
+
+# Check if running under sudo or root; if so, install system-wide, otherwise user space
+ifeq ($(shell id -u), 0)
+    PREFIX ?= /usr/local
+else
+    PREFIX ?= $(HOME)/.local
+endif
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+$(TARGET): main.c commands.c
+	$(CC) $(CFLAGS) main.c commands.c -o $(TARGET)
+
+install: $(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	@echo "Installed $(TARGET) to $(DESTDIR)$(PREFIX)/bin"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	@echo "Uninstalled $(TARGET) from $(DESTDIR)$(PREFIX)/bin"
 
 clean:
 	rm -f $(TARGET)
-	rm -rf build
 
-install: illus
-	install -d /usr/local/bin
-	install -m 755 illus /usr/local/bin/illus
-	@echo "[Dreams] Successfully installed illus to /usr/local/bin/"
-
-uninstall:
-	rm -f /usr/local/bin/illus
-	@echo "[Dreams] Successfully uninstalled illus from /usr/local/bin/"
+.PHONY: all install uninstall clean
