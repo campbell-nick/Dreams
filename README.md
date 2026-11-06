@@ -1,4 +1,11 @@
 # Illution (illus)
+  ___ _ _
+ |_ _| | |_   _ ___
+  | || | | | | / __|
+  | || | | |_| \__ \
+ |___|_|_|\__,_|___/
+
+ ✦ Dreams Package Manager (illus) v1.0.0✦
 
 A lightweight, stateless C package manager designed to build and install software directly into user space (`~/.local/`) while supporting elevated execution via `sudo`.
 
