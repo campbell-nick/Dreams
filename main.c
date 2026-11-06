@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -13,7 +12,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 1. illus --pull {Url}
+    // illus --pull {Url}
     if (strcmp(argv[1], "--pull") == 0) {
         if (argc < 3) {
             fprintf(stderr, "[Dreams] Error: --pull requires a repository URL.\n");
@@ -22,7 +21,7 @@ int main(int argc, char *argv[]) {
         }
         cmd_pull(argc, argv);
     }
-    // 2. illus --cast [--store] [--fresh]
+    // illus --cast [--store] [--fresh]
     else if (strcmp(argv[1], "--cast") == 0) {
         int store = 0;
         int fresh = 0;
@@ -45,7 +44,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
         cmd_version();
     }
-    // 3. illus --shed [Package]
+    // illus --shed [Package]
     else if (strcmp(argv[1], "--shed") == 0) {
         if (argc < 3) {
             fprintf(stderr, "[Dreams] Error: --shed requires a package name.\n");
@@ -54,7 +53,7 @@ int main(int argc, char *argv[]) {
         }
         cmd_shed(argv[2]);
     }
-    // 4. illus --list
+    // illus --list
     else if (strcmp(argv[1], "--list") == 0) {
         cmd_list();
     }
