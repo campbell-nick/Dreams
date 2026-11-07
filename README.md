@@ -14,7 +14,7 @@ Dreams runs the build system of the project it installs, so treat it like
 running `make install` yourself.
 
 - **Do not run `illus --cast --store`, `--pull`, or `--shed` as root**
-  (including via `sudo`). Running `sudo make install` for `illus` itself is
+  (including via `sudo or doas`). Running `sudo make install` for `illus` itself is
   fine, but the package manager must run as your normal user. Files are
   chowned back to you afterward, but build scripts would still execute with
   root privileges.
