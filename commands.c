@@ -1428,8 +1428,13 @@ int cmd_shed(const char *package_name) {
 
         printf("[Dreams] Removing file: %s\n", resolved);
         if (remove(resolved) != 0) {
-            perror("[Dreams] Warning: could not remove file");
-            failures++;
+            if (errno == ENOENT) {
+                /* Already gone (removed manually or by an earlier run). */
+                remove_empty_parents(resolved, resolved_local);
+            } else {
+                perror("[Dreams] Warning: could not remove file");
+                failures++;
+            }
         } else {
             remove_empty_parents(resolved, resolved_local);
         }

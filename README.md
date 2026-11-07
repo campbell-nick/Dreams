@@ -134,7 +134,7 @@ Lists tracked packages. If no manifests exist yet, it falls back to listing bina
 illus --shed <package-or-binary>
 ```
 
-Removes every file tracked in the package manifest, then deletes the manifest. For safety, every path is resolved and must stay inside `~/.local`; paths outside that directory are refused.
+Removes every file tracked in the package manifest, then deletes the manifest. For safety, every path is resolved and must stay inside `~/.local`; paths outside that directory are refused. Entries that no longer exist are treated as already removed, so a partially cleaned package can still be finalized.
 
 ### Other commands
 
