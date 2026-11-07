@@ -19,7 +19,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Usage: illus --pull {Url}\n");
             return 1;
         }
-        cmd_pull(argc, argv);
+        return cmd_pull(argc, argv);
     }
     // illus --cast [--store] [--fresh]
     else if (strcmp(argv[1], "--cast") == 0) {
@@ -36,13 +36,13 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        cmd_cast(store, fresh);
+        return cmd_cast(store, fresh);
     }
     else if (strcmp(argv[1], "--update") == 0) {
-    cmd_update();
+        return cmd_update();
     }
     else if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
-        cmd_version();
+        return cmd_version();
     }
     // illus --shed [Package]
     else if (strcmp(argv[1], "--shed") == 0) {
@@ -51,17 +51,15 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Usage: illus --shed [Package]\n");
             return 1;
         }
-        cmd_shed(argv[2]);
+        return cmd_shed(argv[2]);
     }
     // illus --list
     else if (strcmp(argv[1], "--list") == 0) {
-        cmd_list();
+        return cmd_list();
     }
     else {
         fprintf(stderr, "[Dreams] Error: Unknown command '%s'\n", argv[1]);
         print_help(argv[0]);
         return 1;
     }
-
-    return 0;
 }

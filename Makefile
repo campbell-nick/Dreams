@@ -11,7 +11,7 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): main.c commands.c
+$(TARGET): main.c commands.c commands.h
 	$(CC) $(CFLAGS) main.c commands.c -o $(TARGET)
 
 install: $(TARGET)
