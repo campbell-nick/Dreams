@@ -268,15 +268,45 @@ static int replace_allowed(const char *target, const char *home) {
 /* System areas that should never receive a package clone. */
 static int is_system_area(const char *path) {
     static const char *roots[] = {
-        "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
-        "/root", "/run", "/sbin", "/sys", "/usr", NULL
+        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
+        "/proc", "/root", "/run", "/sbin", "/sys", "/usr", NULL
     };
     size_t i;
 
+    /* /var/tmp is a legitimate scratch destination; the rest of /var is not. */
+    if (is_within(path, "/var/tmp")) return 0;
+    if (is_within(path, "/var")) return 1;
     for (i = 0; roots[i] != NULL; i++) {
         if (is_within(path, roots[i])) return 1;
     }
     return 0;
+}
+
+/*
+ * Walk up to the nearest existing ancestor of path, resolve it, and refuse if
+ * it lands in a system area. This must run before mkdir_p so a symlinked
+ * component cannot make us create directories inside /etc, /usr, etc.
+ */
+static int check_existing_ancestor(const char *path, const char *home) {
+    char probe[PATH_MAX];
+    char resolved[PATH_MAX];
+    size_t len;
+    char *slash;
+
+    if (!path || !*path || strlen(path) >= sizeof probe) return -1;
+    strcpy(probe, path);
+    len = strlen(probe);
+    while (len > 1 && probe[len - 1] == '/') probe[--len] = '\0';
+
+    for (;;) {
+        if (realpath(probe, resolved)) {
+            if (is_within(resolved, home)) return 0;
+            return is_system_area(resolved) ? -1 : 0;
+        }
+        slash = strrchr(probe, '/');
+        if (!slash || slash == probe) return -1;
+        *slash = '\0';
+    }
 }
 /* ------------------------------------------------------------------------- */
 /* Filesystem helpers                                                        */
@@ -468,7 +498,11 @@ static int move_tree(const char *src_root, const char *dst_root, strlist *files,
         } else {
             if (dst_exists) {
                 if (S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode)) {
-                    remove_directory(dst);
+                    fprintf(stderr,
+                            "[Dreams] Warning: refusing to replace directory with file: %s\n",
+                            dst);
+                    rc = -1;
+                    continue;
                 } else if (unlink(dst) != 0) {
                     perror("[Dreams] Warning: could not replace destination");
                     rc = -1;
@@ -596,7 +630,7 @@ static void track_install(const char *home, const char *pkg_name, const char *st
     char local_dir[PATH_MAX];
     char staged_local[PATH_MAX];
     char manifest_dir[PATH_MAX];
-    char filename[256];
+    char filename[PATH_MAX];
     char manifest_file[PATH_MAX];
     struct stat st;
     strlist files;
@@ -617,6 +651,9 @@ static void track_install(const char *home, const char *pkg_name, const char *st
         if (move_tree(staged_local, local_dir, &files, uid, gid) != 0) {
             fprintf(stderr,
                     "[Dreams] Warning: some staged files could not be installed.\n");
+        }
+        if (getuid() == 0) {
+            chown_with_parents(local_dir, home, uid, gid);
         }
         strlist_free(&files);
         return;
@@ -674,7 +711,6 @@ int cmd_pull(int argc, char *argv[]) {
     gid_t gid = 0;
     char *home;
     char repo_name[256];
-    const char *last_slash;
     size_t name_len;
     char *target = NULL;
 
@@ -705,21 +741,31 @@ int cmd_pull(int argc, char *argv[]) {
     }
     printf("[Dreams] Pulling repository from: %s\n", url);
 
-    last_slash = strrchr(url, '/');
-    if (!last_slash || last_slash[1] == '\0') {
-        fprintf(stderr, "[Dreams] Error: Invalid repository URL format.\n");
-        free(home);
-        return 1;
-    }
-    name_len = strlen(last_slash + 1);
-    if (name_len >= sizeof repo_name) {
-        fprintf(stderr, "[Dreams] Error: Repository name is too long.\n");
-        free(home);
-        return 1;
-    }
-    memcpy(repo_name, last_slash + 1, name_len + 1);
-    if (name_len > 4 && strcmp(repo_name + name_len - 4, ".git") == 0) {
-        repo_name[name_len - 4] = '\0';
+    {
+        size_t url_len = strlen(url);
+        const char *name_end;
+        const char *name_start;
+
+        while (url_len > 0 && url[url_len - 1] == '/') url_len--;
+        name_end = url + url_len;
+        name_start = name_end;
+        while (name_start > url && name_start[-1] != '/') name_start--;
+        if (name_start == url) {
+            fprintf(stderr, "[Dreams] Error: Invalid repository URL format.\n");
+            free(home);
+            return 1;
+        }
+        name_len = (size_t)(name_end - name_start);
+        if (name_len == 0 || name_len >= sizeof repo_name) {
+            fprintf(stderr, "[Dreams] Error: Repository name is too long.\n");
+            free(home);
+            return 1;
+        }
+        memcpy(repo_name, name_start, name_len);
+        repo_name[name_len] = '\0';
+        if (name_len > 4 && strcmp(repo_name + name_len - 4, ".git") == 0) {
+            repo_name[name_len - 4] = '\0';
+        }
     }
     if (!is_valid_name(repo_name)) {
         fprintf(stderr, "[Dreams] Error: Extracted repository name is invalid.\n");
@@ -764,6 +810,14 @@ int cmd_pull(int argc, char *argv[]) {
                 free(home);
                 return 1;
             }
+            if (check_existing_ancestor(parent, home) != 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: refusing to create destination under system path: %s\n",
+                        parent);
+                free(target);
+                free(home);
+                return 1;
+            }
             if (mkdir_p(parent, 0755) != 0) {
                 perror("[Dreams] Error: could not create destination parent");
                 free(target);
@@ -772,13 +826,18 @@ int cmd_pull(int argc, char *argv[]) {
             }
             {
                 char resolved_parent[PATH_MAX];
+                char resolved_home[PATH_MAX];
+                const char *safe_home = home;
+
+                if (realpath(home, resolved_home)) safe_home = resolved_home;
                 if (!realpath(parent, resolved_parent)) {
                     perror("[Dreams] Error: could not resolve destination parent");
                     free(target);
                     free(home);
                     return 1;
                 }
-                if (is_system_area(resolved_parent)) {
+                if (is_system_area(resolved_parent) &&
+                    !is_within(resolved_parent, safe_home)) {
                     fprintf(stderr,
                             "[Dreams] Error: refusing to clone into system directory: %s\n",
                             resolved_parent);
@@ -879,6 +938,7 @@ int cmd_pull(int argc, char *argv[]) {
 
     if (getuid() == 0) {
         recursive_chown(target, uid, gid);
+        chown_with_parents(target, home, uid, gid);
     }
 
     printf("[Dreams] Successfully pulled and stored in %s\n", target);
@@ -937,7 +997,8 @@ int cmd_cast(int store, int fresh) {
     base = strrchr(workspace, '/');
     base = base ? base + 1 : workspace;
     base_len = strlen(base);
-    can_track = (base_len > 0 && base_len < sizeof pkg_name && is_valid_name(base));
+    can_track = (base_len > 0 && base_len + 4 < sizeof pkg_name &&
+                 is_valid_name(base));
     if (can_track) {
         memcpy(pkg_name, base, base_len + 1);
     } else {
@@ -1126,9 +1187,17 @@ int cmd_update(void) {
 
     dir = opendir(dreams_path);
     if (!dir) {
-        printf("Your Dreams are empty.\n");
+        int saved = errno;
+
+        if (saved == ENOENT) {
+            printf("Your Dreams are empty.\n");
+            free(home);
+            return 0;
+        }
+        errno = saved;
+        perror("[Dreams] Error: could not open ~/Dreams");
         free(home);
-        return 0;
+        return 1;
     }
 
     while ((entry = readdir(dir)) != NULL) {
@@ -1225,7 +1294,7 @@ int cmd_shed(const char *package_name) {
     char *home;
     char local_dir[PATH_MAX];
     char manifest_dir[PATH_MAX];
-    char filename[256];
+    char filename[PATH_MAX];
     char direct_manifest[PATH_MAX];
     char manifest_path[PATH_MAX] = "";
     char resolved_local[PATH_MAX];
@@ -1367,9 +1436,11 @@ int cmd_shed(const char *package_name) {
     }
     fclose(f);
 
-    if (remove(manifest_path) != 0) {
-        perror("[Dreams] Warning: could not remove manifest");
-        failures++;
+    if (failures == 0) {
+        if (remove(manifest_path) != 0) {
+            perror("[Dreams] Warning: could not remove manifest");
+            failures++;
+        }
     }
 
     if (failures == 0) {
@@ -1378,6 +1449,8 @@ int cmd_shed(const char *package_name) {
         fprintf(stderr,
                 "[Dreams] Package '%s' was partially removed (%d issue(s)).\n",
                 package_name, failures);
+        fprintf(stderr, "[Dreams] Manifest kept at %s for retry.\n",
+                manifest_path);
     }
 
     free(home);
