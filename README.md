@@ -8,6 +8,36 @@ A lightweight, stateless C package manager that builds and installs software int
 
 This project is still in development. You may face bugs or issues. Please report them if you find any.
 
+## Safe usage
+
+Dreams runs the build system of the project it installs, so treat it like
+running `make install` yourself.
+
+- **Do not run `illus --cast --store`, `--pull`, or `--shed` as root**
+  (including via `sudo`). Running `sudo make install` for `illus` itself is
+  fine, but the package manager must run as your normal user. Files are
+  chowned back to you afterward, but build scripts would still execute with
+  root privileges.
+- Ensure `~/.local` and `~/Dreams` are owned by you and are not
+  world-writable.
+- Run one `illus` command at a time.
+- If `--shed` reports that a package was only partially removed, keep its
+  manifest in `~/.local/share/illus/` and retry.
+- Avoid `--force` on destinations you care about.
+- Only install repositories you trust; packages are not sandboxed, signed,
+  or verified.
+
+## Known limitations
+
+- Manifest files are written non-atomically; a crash or full disk during an
+  install can leave a truncated manifest.
+- There is no locking, so concurrent `illus` processes are not supported.
+- Filesystem containment checks are best-effort and do not guard against a
+  malicious local process racing symlinks inside `~/.local`.
+- `~/.local` and the home directory are assumed to be real directories, not
+  symlinks.
+Two wording choices worth keeping: explain why root is unsafe (scripts still run as root), and frame the limitations as "best-effort" rather than implying guarantees.
+
 ## Features
 
 - **Stateless design**: Builds from the current working directory and resolves target paths dynamically without a central database.
