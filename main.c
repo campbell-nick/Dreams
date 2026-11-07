@@ -12,8 +12,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // illus --help
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_help(argv[0]);
+        return 0;
+    }
     // illus --pull {Url}
-    if (strcmp(argv[1], "--pull") == 0) {
+    else if (strcmp(argv[1], "--pull") == 0) {
         if (argc < 3) {
             fprintf(stderr, "[Dreams] Error: --pull requires a repository URL.\n");
             fprintf(stderr, "Usage: illus --pull {Url}\n");

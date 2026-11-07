@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Wpedantic -std=c99 -O2
+CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wformat-security -std=c99 -O2
 TARGET = illus
 
 ifeq ($(shell id -u), 0)

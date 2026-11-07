@@ -8,6 +8,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Define the executable target from main.c
 add_executable(illus main.c commands.c)
 
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(illus PRIVATE
+        -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wformat-security
+    )
+endif()
+
 # Include GNU install directories standard (maps bin to bin, etc.)
 include(GNUInstallDirs)
 

@@ -1,32 +1,38 @@
 # Illution (illus)
 
-✦ Dreams Package Manager (illus) v1.0.0✦
+✦ Dreams Package Manager (illus) v1.0.0 ✦
 
-A lightweight, stateless C package manager designed to build and install software directly into user space (`~/.local/`) while supporting elevated execution via `sudo`.
+A lightweight, stateless C package manager that builds and installs software into user space (`~/.local/`), with support for elevated execution via `sudo`.
 
 ## WARNING (Use at your own risk)
-This is project is still in development. You may face bugs or issues. Feel free to contact me if you find any issues.
+
+This project is still in development. You may face bugs or issues. Please report them if you find any.
 
 ## Features
 
-- **Stateless Design**: Uses current working directories (`getcwd()`) and target paths dynamically without needing a centralized local database.
-- **Sudo-Aware Directory Resolution**: Automatically resolves the real calling user's home directory (`~/.local/`) using `SUDO_USER` and `<pwd.h>`, ensuring packages are installed into the correct user space even when run under `sudo`.
-- **Build System Detection**: Auto-detects `Makefile` and `CMakeLists.txt` build systems with prefix injection.
-- **Manifest Tracking**: Automatically tracks installed files for straightforward management.
+- **Stateless design**: Builds from the current working directory and resolves target paths dynamically without a central database.
+- **Sudo-aware directory resolution**: Uses `SUDO_USER` and `<pwd.h>` to find the real user's home, so packages still install into the correct user space under `sudo`.
+- **Ownership fixups**: Files installed under `sudo` are recursively chowned back to the invoking user.
+- **Build system detection**: Auto-detects `Makefile` and `CMakeLists.txt` with prefix injection.
+- **Manifest tracking**: Records the actual files installed into `~/.local`, so uninstalling removes binaries, libraries, headers, and data files.
+- **Package or binary lookup**: `--shed` accepts either the package/repository name or an installed binary name.
 
 ## Building & Installing `Dreams`
 
-First clone the repo:
+Clone the repo:
+
 ```bash
-git clone https://github.com/campbell-nick/Illution.git
+git clone https://github.com/campbell-nick/Dreams.git
 ```
-To build and install `illus` locally to `~/.local/bin`:
+
+Build and install `illus` locally to `~/.local/bin`:
+
 ```bash
 make
 make install
 ```
 
-To build and install `illus` system-wide to `/usr/local/bin`:
+Build and install `illus` system-wide to `/usr/local/bin`:
 
 ```bash
 make
@@ -39,33 +45,71 @@ sudo make install
 sudo make uninstall
 ```
 
-## Basic Usage of Dreams.
+## Basic Usage
 
-### Cloning repos:
-```bash
-illus --pull {URL}
-```
-
-This will clone to the ~/Dreams folder by default. If you want to clone into your custom directory, you can use the --dir flag.
+### Cloning repositories
 
 ```bash
-illus --pull {URL} --dir ~/Your/Directory
+illus --pull <url>
 ```
 
-#### Building the project
+Repositories are cloned into `~/Dreams/<repo-name>` by default.
+
+To clone into an explicit destination, use `--dir`. The path is the exact destination directory and supports `~`, `~/...`, absolute, and relative paths:
+
+```bash
+illus --pull <url> --dir ~/Projects/my-project
+```
+
+Existing destinations are refused unless `--force` is passed. `--force` replaces the destination only after its path has been validated; it never follows the final symlink.
+
+### Building the project
 
 ```bash
 illus --cast
 ```
 
-This stores the binary to ~/.local/bin/ Folder by default.
+`--cast` builds the project in the current directory. It does **not** install by default.
 
 ```bash
 illus --cast --store
 ```
 
-#### Uninstalling
+`--store` builds and installs into `~/.local`, then writes a manifest under `~/.local/share/illus/`.
 
 ```bash
-illus --shed {Package}
+illus --cast --fresh
+```
+
+`--fresh` removes the CMake `build/` directory and runs `make clean` (when a Makefile is present) before building.
+
+### Updating
+
+```bash
+illus --update
+```
+
+Pulls, rebuilds, and reinstalls every repository under `~/Dreams` that has a recognized build system.
+
+### Listing packages
+
+```bash
+illus --list
+```
+
+Lists tracked packages. If no manifests exist yet, it falls back to listing binaries in `~/.local/bin`.
+
+### Uninstalling
+
+```bash
+illus --shed <package-or-binary>
+```
+
+Removes every file tracked in the package manifest, then deletes the manifest. For safety, every path is resolved and must stay inside `~/.local`; paths outside that directory are refused.
+
+### Other commands
+
+```bash
+illus --version
+illus --help
 ```
