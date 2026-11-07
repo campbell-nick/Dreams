@@ -39,7 +39,7 @@ sudo make install
 sudo make uninstall
 ```
 
-## Usage of Dreams.
+## Basic Usage of Dreams.
 
 ### Cloning repos:
 ```bash
@@ -52,3 +52,20 @@ This will clone to the ~/Dreams folder by default. If you want to clone into you
 illus --pull {URL} --dir ~/Your/Directory
 ```
 
+#### Building the project
+
+```bash
+illus --cast
+```
+
+This stores the binary to ~/.local/bin/ Folder by default.
+
+```bash
+illus --cast --store
+```
+
+#### Uninstalling
+
+```bash
+illus --shed {Package}
+```
