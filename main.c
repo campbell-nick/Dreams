@@ -7,6 +7,8 @@
 #include "commands.h"
 
 int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) {
         print_help(argv[0]);
         return 1;

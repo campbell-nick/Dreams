@@ -14,7 +14,7 @@ This project is still in development. You may face bugs or issues. Please report
 - **Sudo-aware directory resolution**: Uses `SUDO_USER` and `<pwd.h>` to find the real user's home, so packages still install into the correct user space under `sudo`.
 - **Ownership fixups**: Files installed under `sudo` are recursively chowned back to the invoking user.
 - **Build system detection**: Auto-detects `Makefile` and `CMakeLists.txt` with prefix injection.
-- **Manifest tracking**: Records the actual files installed into `~/.local`, so uninstalling removes binaries, libraries, headers, and data files.
+- **Manifest tracking**: Installs are staged with `DESTDIR` and moved into `~/.local` only after a successful build, so manifests record exactly the files the package installed. If a build system ignores `DESTDIR`, illus warns and skips the manifest instead of guessing.
 - **Package or binary lookup**: `--shed` accepts either the package/repository name or an installed binary name.
 
 ## Building & Installing `Dreams`
@@ -61,7 +61,7 @@ To clone into an explicit destination, use `--dir`. The path is the exact destin
 illus --pull <url> --dir ~/Projects/my-project
 ```
 
-Existing destinations are refused unless `--force` is passed. `--force` replaces the destination only after its path has been validated; it never follows the final symlink.
+Existing destinations are refused unless `--force` is passed. `--force` replaces the destination only after its path has been validated; it never follows the final symlink. Recursive replacement is limited to destinations inside your home directory or `/tmp`/`/var/tmp`, and system locations are refused.
 
 ### Building the project
 
@@ -75,7 +75,7 @@ illus --cast
 illus --cast --store
 ```
 
-`--store` builds and installs into `~/.local`, then writes a manifest under `~/.local/share/illus/`.
+`--store` builds and installs into `~/.local`, then writes a manifest under `~/.local/share/illus/`. Installation is staged with `DESTDIR`, so only files created by the package are tracked. A build system that ignores `DESTDIR` still installs, but no manifest is written and a warning is shown.
 
 ```bash
 illus --cast --fresh

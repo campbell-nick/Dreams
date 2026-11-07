@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +10,6 @@
 #include <pwd.h>
 #include <limits.h>
 #include <errno.h>
-#include <time.h>
 #include "commands.h"
 
 #define ILLUS_VERSION "1.0.0"
@@ -42,6 +41,27 @@ static int run_cmd(char *const argv[]) {
         return WEXITSTATUS(status);
     }
     return -1;
+}
+
+/* Run a command with DESTDIR set for the child only, restoring it afterwards. */
+static int run_cmd_with_destdir(char *const argv[], const char *destdir) {
+    const char *old = getenv("DESTDIR");
+    char *saved = old ? strdup(old) : NULL;
+    int rc;
+
+    if (setenv("DESTDIR", destdir, 1) != 0) {
+        free(saved);
+        perror("[Dreams] Error: setenv failed");
+        return -1;
+    }
+    rc = run_cmd(argv);
+    if (saved) {
+        setenv("DESTDIR", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("DESTDIR");
+    }
+    return rc;
 }
 
 /* Get the real user's home directory and UID/GID, even under sudo. */
@@ -211,7 +231,18 @@ static int is_protected_target(const char *target, const char *home) {
         "", ".local", ".local/bin", ".local/lib", ".local/share",
         ".ssh", ".config", "Dreams", NULL
     };
+    static const char *roots[] = {
+        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
+        "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin",
+        "/srv", "/sys", "/tmp", "/usr", "/var", "/var/tmp", NULL
+    };
     size_t i;
+
+    for (i = 0; roots[i] != NULL; i++) {
+        if (strcmp(target, roots[i]) == 0) return 1;
+    }
+    /* Reject home itself and any ancestor of home (e.g. /home or /). */
+    if (is_within(home, target)) return 1;
 
     for (i = 0; names[i] != NULL; i++) {
         char p[PATH_MAX];
@@ -221,6 +252,29 @@ static int is_protected_target(const char *target, const char *home) {
                    strcmp(target, p) == 0) {
             return 1;
         }
+    }
+    return 0;
+}
+
+/* Allow a --force replacement only inside home or the temp directories. */
+static int replace_allowed(const char *target, const char *home) {
+    if (strcmp(target, "/") == 0 || strcmp(target, home) == 0) return 0;
+    if (is_within(target, home)) return 1;
+    if (is_within(target, "/tmp") && strcmp(target, "/tmp") != 0) return 1;
+    if (is_within(target, "/var/tmp") && strcmp(target, "/var/tmp") != 0) return 1;
+    return 0;
+}
+
+/* System areas that should never receive a package clone. */
+static int is_system_area(const char *path) {
+    static const char *roots[] = {
+        "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
+        "/root", "/run", "/sbin", "/sys", "/usr", NULL
+    };
+    size_t i;
+
+    for (i = 0; roots[i] != NULL; i++) {
+        if (is_within(path, roots[i])) return 1;
     }
     return 0;
 }
@@ -342,7 +396,8 @@ static void strlist_free(strlist *l) {
 }
 
 /* Re-read an existing manifest so upgrades keep ownership of old files. */
-static void load_manifest(strlist *files, const char *manifest, const char *skip_dir) {
+static void load_manifest(strlist *files, const char *manifest,
+                          const char *local_dir, const char *skip_dir) {
     FILE *f = fopen(manifest, "r");
     char line[PATH_MAX];
 
@@ -351,6 +406,7 @@ static void load_manifest(strlist *files, const char *manifest, const char *skip
         struct stat st;
         line[strcspn(line, "\r\n")] = '\0';
         if (!line[0]) continue;
+        if (!is_within(line, local_dir)) continue;
         if (skip_dir && is_within(line, skip_dir)) continue;
         if (lstat(line, &st) != 0) continue;
         if (strlist_add(files, line) != 0) break;
@@ -358,31 +414,103 @@ static void load_manifest(strlist *files, const char *manifest, const char *skip
     fclose(f);
 }
 
-/* Collect files under dir that were created/modified at or after cutoff. */
-static void collect_files(const char *dir, time_t cutoff, const char *skip_dir,
-                          strlist *files) {
+/* Move a staged install tree into place, recording every final file path. */
+static int move_tree(const char *src_root, const char *dst_root, strlist *files,
+                     uid_t uid, gid_t gid) {
     DIR *d;
     struct dirent *p;
+    int rc = 0;
 
-    if (skip_dir && strcmp(dir, skip_dir) == 0) return;
-    d = opendir(dir);
-    if (!d) return;
+    d = opendir(src_root);
+    if (!d) {
+        perror("[Dreams] Warning: could not read staged install");
+        return -1;
+    }
     while ((p = readdir(d)) != NULL) {
-        char path[PATH_MAX];
+        char src[PATH_MAX];
+        char dst[PATH_MAX];
         struct stat st;
+        struct stat dst_st;
+        int dst_exists;
 
         if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) continue;
-        if (path_join(path, sizeof path, dir, p->d_name) != 0) continue;
-        if (lstat(path, &st) != 0) continue;
+        if (path_join(src, sizeof src, src_root, p->d_name) != 0) continue;
+        if (path_join(dst, sizeof dst, dst_root, p->d_name) != 0) continue;
+        if (lstat(src, &st) != 0) continue;
+
+        dst_exists = (lstat(dst, &dst_st) == 0);
+
         if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
-            if (!skip_dir || strcmp(path, skip_dir) != 0) {
-                collect_files(path, cutoff, skip_dir, files);
+            if (dst_exists && !(S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode))) {
+                if (S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode)) {
+                    remove_directory(dst);
+                } else if (unlink(dst) != 0) {
+                    perror("[Dreams] Warning: could not replace destination");
+                    rc = -1;
+                    continue;
+                }
             }
-        } else if (st.st_mtime >= cutoff) {
-            if (strlist_add(files, path) != 0) break;
+            if (mkdir_p(dst, st.st_mode & 0777) != 0) {
+                perror("[Dreams] Warning: could not create installation directory");
+                rc = -1;
+                continue;
+            }
+            if (chmod(dst, st.st_mode & 07777) != 0) {
+                /* best effort */
+            }
+            if (getuid() == 0 && lchown(dst, uid, gid) != 0) {
+                /* best effort */
+            }
+            if (move_tree(src, dst, files, uid, gid) != 0) rc = -1;
+            if (rmdir(src) != 0) {
+                /* best effort */
+            }
+        } else {
+            if (dst_exists) {
+                if (S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode)) {
+                    remove_directory(dst);
+                } else if (unlink(dst) != 0) {
+                    perror("[Dreams] Warning: could not replace destination");
+                    rc = -1;
+                    continue;
+                }
+            }
+            if (rename(src, dst) != 0) {
+                perror("[Dreams] Warning: could not install file");
+                rc = -1;
+                continue;
+            }
+            if (getuid() == 0 && lchown(dst, uid, gid) != 0) {
+                /* best effort */
+            }
+            if (strlist_add(files, dst) != 0) rc = -1;
         }
     }
     closedir(d);
+    return rc;
+}
+
+/* Create a private staging directory under ~/.local for a DESTDIR install. */
+static int make_stage_dir(const char *home, char *out, size_t out_size) {
+    char local_dir[PATH_MAX];
+    char template[PATH_MAX];
+
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0) return -1;
+    if (mkdir_p(local_dir, 0755) != 0) return -1;
+    if (path_join(template, sizeof template, local_dir,
+                  ".illus-stage-XXXXXX") != 0) {
+        return -1;
+    }
+    if (!mkdtemp(template)) {
+        perror("[Dreams] Error: could not create staging directory");
+        return -1;
+    }
+    if (strlen(template) >= out_size) {
+        remove_directory(template);
+        return -1;
+    }
+    strcpy(out, template);
+    return 0;
 }
 
 /* Find a manifest that owns the given binary name. */
@@ -438,7 +566,6 @@ static int resolve_for_delete(const char *line, char *out, size_t out_size) {
     char parent[PATH_MAX];
     char resolved_parent[PATH_MAX];
 
-    if (realpath(line, out)) return 0;
     if (parent_dir(line, parent, sizeof parent) != 0) return -1;
     if (!realpath(parent, resolved_parent)) return -1;
     base = strrchr(line, '/');
@@ -463,19 +590,38 @@ static void remove_empty_parents(const char *path, const char *stop) {
     }
 }
 
-/* Record every file installed into ~/.local since install_start. */
-static void track_install(const char *home, const char *pkg_name, time_t install_start,
+/* Move a DESTDIR stage into ~/.local and write the package manifest. */
+static void track_install(const char *home, const char *pkg_name, const char *stage,
                           uid_t uid, gid_t gid) {
     char local_dir[PATH_MAX];
+    char staged_local[PATH_MAX];
     char manifest_dir[PATH_MAX];
     char filename[256];
     char manifest_file[PATH_MAX];
+    struct stat st;
     strlist files;
     FILE *mf;
     size_t i;
 
     memset(&files, 0, sizeof files);
     if (path_join(local_dir, sizeof local_dir, home, ".local") != 0) return;
+    if (path_join(staged_local, sizeof staged_local, stage, local_dir) != 0) return;
+
+    if (lstat(staged_local, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr,
+                "[Dreams] Warning: build system ignored DESTDIR; no manifest written.\n");
+        return;
+    }
+
+    if (!pkg_name || !*pkg_name) {
+        if (move_tree(staged_local, local_dir, &files, uid, gid) != 0) {
+            fprintf(stderr,
+                    "[Dreams] Warning: some staged files could not be installed.\n");
+        }
+        strlist_free(&files);
+        return;
+    }
+
     if (path_join(manifest_dir, sizeof manifest_dir, home,
                   ".local/share/illus") != 0) {
         return;
@@ -489,8 +635,12 @@ static void track_install(const char *home, const char *pkg_name, time_t install
         return;
     }
 
-    load_manifest(&files, manifest_file, manifest_dir);
-    collect_files(local_dir, install_start, manifest_dir, &files);
+    load_manifest(&files, manifest_file, local_dir, manifest_dir);
+
+    if (move_tree(staged_local, local_dir, &files, uid, gid) != 0) {
+        fprintf(stderr,
+                "[Dreams] Warning: some staged files could not be installed.\n");
+    }
 
     mf = fopen(manifest_file, "w");
     if (!mf) {
@@ -504,9 +654,6 @@ static void track_install(const char *home, const char *pkg_name, time_t install
     fclose(mf);
 
     if (getuid() == 0) {
-        for (i = 0; i < files.len; i++) {
-            chown_with_parents(files.items[i], local_dir, uid, gid);
-        }
         chown_with_parents(manifest_file, local_dir, uid, gid);
     }
 
@@ -623,6 +770,23 @@ int cmd_pull(int argc, char *argv[]) {
                 free(home);
                 return 1;
             }
+            {
+                char resolved_parent[PATH_MAX];
+                if (!realpath(parent, resolved_parent)) {
+                    perror("[Dreams] Error: could not resolve destination parent");
+                    free(target);
+                    free(home);
+                    return 1;
+                }
+                if (is_system_area(resolved_parent)) {
+                    fprintf(stderr,
+                            "[Dreams] Error: refusing to clone into system directory: %s\n",
+                            resolved_parent);
+                    free(target);
+                    free(home);
+                    return 1;
+                }
+            }
         }
     } else {
         char dreams_dir[PATH_MAX];
@@ -670,7 +834,28 @@ int cmd_pull(int argc, char *argv[]) {
                 return 1;
             }
             if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
-                remove_directory(target);
+                char resolved_target[PATH_MAX];
+                char resolved_home[PATH_MAX];
+                const char *safe_home = home;
+
+                if (realpath(home, resolved_home)) safe_home = resolved_home;
+                if (!realpath(target, resolved_target)) {
+                    perror("[Dreams] Error: could not resolve existing destination");
+                    free(target);
+                    free(home);
+                    return 1;
+                }
+                if (!replace_allowed(resolved_target, safe_home)) {
+                    fprintf(stderr,
+                            "[Dreams] Error: refusing to recursively remove %s\n",
+                            resolved_target);
+                    fprintf(stderr,
+                            "[Dreams] Choose a destination inside your home directory or /tmp.\n");
+                    free(target);
+                    free(home);
+                    return 1;
+                }
+                remove_directory(resolved_target);
             } else if (unlink(target) != 0) {
                 perror("[Dreams] Error: could not remove existing destination");
                 free(target);
@@ -712,6 +897,7 @@ int cmd_cast(int store, int fresh) {
     char *home = get_real_home(&uid, &gid);
     char workspace[PATH_MAX];
     char local_dir[PATH_MAX];
+    char stage[PATH_MAX];
     char cmake_path[PATH_MAX];
     char makefile_path[PATH_MAX];
     char build_dir[PATH_MAX];
@@ -815,19 +1001,27 @@ int cmd_cast(int store, int fresh) {
             }
         }
         if (store) {
-            time_t install_start = time(NULL);
             char *const install_argv[] = {"cmake", "--install", build_dir, NULL};
+
+            if (make_stage_dir(home, stage, sizeof stage) != 0) {
+                fprintf(stderr, "[Dreams] Error: could not create staging directory.\n");
+                free(home);
+                return 1;
+            }
             printf("[Dreams] Storing package into %s (--store)...\n", local_dir);
-            if (run_cmd(install_argv) != 0) {
+            if (run_cmd_with_destdir(install_argv, stage) != 0) {
                 fprintf(stderr, "[Dreams] Error: installation failed.\n");
+                remove_directory(stage);
                 free(home);
                 return 1;
             }
             if (can_track) {
-                track_install(home, pkg_name, install_start, uid, gid);
+                track_install(home, pkg_name, stage, uid, gid);
             } else {
-                fprintf(stderr, "[Dreams] Warning: invalid package name; manifest not written.\n");
+                fprintf(stderr, "[Dreams] Warning: invalid package name; installing without a manifest.\n");
+                track_install(home, NULL, stage, uid, gid);
             }
+            remove_directory(stage);
         }
     } else {
         printf("[Dreams] Detected Make build system.\n");
@@ -840,37 +1034,55 @@ int cmd_cast(int store, int fresh) {
             }
         }
         if (store) {
-            time_t install_start = time(NULL);
             char prefix_env[PATH_MAX];
+            char destdir_env[PATH_MAX];
             const char *opt = "PREFIX=";
+            const char *dopt = "DESTDIR=";
             size_t opt_len = strlen(opt);
+            size_t dopt_len = strlen(dopt);
             size_t dir_len = strlen(local_dir);
-            char *install_argv[4];
+            size_t stage_len;
+            char *install_argv[5];
 
-            if (opt_len + dir_len + 1 > sizeof prefix_env) {
+            if (make_stage_dir(home, stage, sizeof stage) != 0) {
+                fprintf(stderr, "[Dreams] Error: could not create staging directory.\n");
+                free(home);
+                return 1;
+            }
+            stage_len = strlen(stage);
+
+            if (opt_len + dir_len + 1 > sizeof prefix_env ||
+                dopt_len + stage_len + 1 > sizeof destdir_env) {
                 fprintf(stderr, "[Dreams] Error: install prefix is too long.\n");
+                remove_directory(stage);
                 free(home);
                 return 1;
             }
             memcpy(prefix_env, opt, opt_len);
             memcpy(prefix_env + opt_len, local_dir, dir_len + 1);
+            memcpy(destdir_env, dopt, dopt_len);
+            memcpy(destdir_env + dopt_len, stage, stage_len + 1);
 
             install_argv[0] = "make";
             install_argv[1] = "install";
             install_argv[2] = prefix_env;
-            install_argv[3] = NULL;
+            install_argv[3] = destdir_env;
+            install_argv[4] = NULL;
 
             printf("[Dreams] Storing package into %s (--store)...\n", local_dir);
-            if (run_cmd(install_argv) != 0) {
+            if (run_cmd_with_destdir(install_argv, stage) != 0) {
                 fprintf(stderr, "[Dreams] Error: installation failed.\n");
+                remove_directory(stage);
                 free(home);
                 return 1;
             }
             if (can_track) {
-                track_install(home, pkg_name, install_start, uid, gid);
+                track_install(home, pkg_name, stage, uid, gid);
             } else {
-                fprintf(stderr, "[Dreams] Warning: invalid package name; manifest not written.\n");
+                fprintf(stderr, "[Dreams] Warning: invalid package name; installing without a manifest.\n");
+                track_install(home, NULL, stage, uid, gid);
             }
+            remove_directory(stage);
         }
     }
 
@@ -1016,7 +1228,6 @@ int cmd_shed(const char *package_name) {
     char filename[256];
     char direct_manifest[PATH_MAX];
     char manifest_path[PATH_MAX] = "";
-    char resolved_home[PATH_MAX];
     char resolved_local[PATH_MAX];
     char line[PATH_MAX];
     FILE *f = NULL;
@@ -1044,6 +1255,15 @@ int cmd_shed(const char *package_name) {
         fprintf(stderr, "[Dreams] Error: path is too long.\n");
         free(home);
         return 1;
+    }
+
+    /* Resolve the install root once so containment checks are consistent. */
+    if (!realpath(local_dir, resolved_local)) {
+        if (path_join(resolved_local, sizeof resolved_local, home, ".local") != 0) {
+            fprintf(stderr, "[Dreams] Error: path is too long.\n");
+            free(home);
+            return 1;
+        }
     }
 
     f = fopen(direct_manifest, "r");
@@ -1085,18 +1305,19 @@ int cmd_shed(const char *package_name) {
                                    sizeof resolved_fallback) != 0) {
                 strcpy(resolved_fallback, fallback);
             }
+            if (!is_within(resolved_fallback, resolved_local)) {
+                fprintf(stderr,
+                        "[Dreams] Error: refusing to delete outside %s: %s\n",
+                        resolved_local, fallback);
+                free(home);
+                return 1;
+            }
             if (remove(resolved_fallback) != 0) {
                 perror("[Dreams] Error: could not remove binary");
                 free(home);
                 return 1;
             }
-            if (!realpath(home, resolved_home)) {
-                strcpy(resolved_home, home);
-            }
-            if (path_join(resolved_local, sizeof resolved_local, resolved_home,
-                          ".local") == 0) {
-                remove_empty_parents(resolved_fallback, resolved_local);
-            }
+            remove_empty_parents(resolved_fallback, resolved_local);
             printf("[Dreams] Successfully removed %s\n", fallback);
             free(home);
             return 0;
@@ -1108,14 +1329,13 @@ int cmd_shed(const char *package_name) {
         return 1;
     }
 
-    if (!realpath(home, resolved_home)) {
-        strcpy(resolved_home, home);
-    }
-    if (path_join(resolved_local, sizeof resolved_local, resolved_home, ".local") != 0) {
-        fprintf(stderr, "[Dreams] Error: path is too long.\n");
-        fclose(f);
-        free(home);
-        return 1;
+    if (!realpath(local_dir, resolved_local)) {
+        if (path_join(resolved_local, sizeof resolved_local, home, ".local") != 0) {
+            fprintf(stderr, "[Dreams] Error: path is too long.\n");
+            fclose(f);
+            free(home);
+            return 1;
+        }
     }
 
     while (fgets(line, sizeof line, f)) {
