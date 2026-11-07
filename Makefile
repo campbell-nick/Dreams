@@ -1,8 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2
+CFLAGS = -Wall -Wextra -Wpedantic -std=c99 -O2
 TARGET = illus
 
-# Check if running under sudo or root; if so, install system-wide, otherwise user space
 ifeq ($(shell id -u), 0)
     PREFIX ?= /usr/local
 else

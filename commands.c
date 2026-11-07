@@ -11,7 +11,9 @@
 #include <errno.h>
 #include "commands.h"
 
-// Safe process execution helper (replaces vulnerable system() calls)
+#define ILLUS_VERSION "1.0.0"
+
+// Safe process execution helper
 static int run_cmd(char *const argv[]) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -34,49 +36,32 @@ static int run_cmd(char *const argv[]) {
     return -1;
 }
 
-// Helper function to get the real user's home directory and UID/GID (even under sudo)
+// Get real user's home directory and UID/GID safely (fails if unresolvable)
 static char* get_real_home(uid_t *out_uid, gid_t *out_gid) {
     uid_t uid = getuid();
     gid_t gid = getgid();
     const char *sudo_user = getenv("SUDO_USER");
     
+    struct passwd *pw = NULL;
     if (uid == 0 && sudo_user) {
-        struct passwd *pw = getpwnam(sudo_user);
-        if (pw && pw->pw_dir) {
-            if (out_uid) *out_uid = pw->pw_uid;
-            if (out_gid) *out_gid = pw->pw_gid;
-            char *path = malloc(strlen(pw->pw_dir) + 1);
-            if (path) strcpy(path, pw->pw_dir);
-            return path;
-        }
+        pw = getpwnam(sudo_user);
     }
-    
-    struct passwd *pw = getpwuid(uid);
-    if (pw && pw->pw_dir) {
-        if (out_uid) *out_uid = uid;
-        if (out_gid) *out_gid = gid;
-        char *path = malloc(strlen(pw->pw_dir) + 1);
-        if (path) strcpy(path, pw->pw_dir);
-        return path;
+    if (!pw) {
+        pw = getpwuid(uid);
     }
-    
-    const char *home = getenv("HOME");
-    if (home) {
-        if (out_uid) *out_uid = uid;
-        if (out_gid) *out_gid = gid;
-        char *path = malloc(strlen(home) + 1);
-        if (path) strcpy(path, home);
-        return path;
+    if (!pw || !pw->pw_dir) {
+        return NULL;
     }
-    
-    if (out_uid) *out_uid = uid;
-    if (out_gid) *out_gid = gid;
-    char *path = malloc(5);
-    if (path) strcpy(path, "/tmp");
+
+    if (out_uid) *out_uid = pw->pw_uid;
+    if (out_gid) *out_gid = pw->pw_gid;
+
+    char *path = malloc(strlen(pw->pw_dir) + 1);
+    if (path) strcpy(path, pw->pw_dir);
     return path;
 }
 
-// Sanitize names to prevent path traversal
+// Validate package/repo names strictly
 static int is_valid_name(const char *name) {
     if (!name || *name == '\0') return 0;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
@@ -90,7 +75,7 @@ static int is_valid_name(const char *name) {
     return 1;
 }
 
-// Recursive directory removal helper for safe cleanup
+// Symlink-safe recursive directory removal
 static void remove_directory(const char *path) {
     DIR *d = opendir(path);
     if (!d) return;
@@ -98,15 +83,44 @@ static void remove_directory(const char *path) {
     while ((p = readdir(d)) != NULL) {
         if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) continue;
         char buf[PATH_MAX];
-        snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
+        int written = snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
+        if (written < 0 || (size_t)written >= sizeof(buf)) continue;
+
         struct stat statbuf;
-        if (!lstat(buf, &statbuf)) {
-            if (S_ISDIR(statbuf.st_mode)) remove_directory(buf);
-            else unlink(buf);
+        // Use lstat to prevent following symlinks into system directories
+        if (lstat(buf, &statbuf) == 0) {
+            if (S_ISDIR(statbuf.st_mode) && !S_ISLNK(statbuf.st_mode)) {
+                remove_directory(buf);
+            } else {
+                unlink(buf);
+            }
         }
     }
     closedir(d);
     rmdir(path);
+}
+
+// Recursive chown helper for staged/installed files
+static void recursive_chown(const char *path, uid_t uid, gid_t gid) {
+    chown(path, uid, gid);
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *p;
+    while ((p = readdir(d)) != NULL) {
+        if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) continue;
+        char buf[PATH_MAX];
+        int written = snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
+        if (written < 0 || (size_t)written >= sizeof(buf)) continue;
+
+        struct stat statbuf;
+        if (lstat(buf, &statbuf) == 0) {
+            chown(buf, uid, gid);
+            if (S_ISDIR(statbuf.st_mode) && !S_ISLNK(statbuf.st_mode)) {
+                recursive_chown(buf, uid, gid);
+            }
+        }
+    }
+    closedir(d);
 }
 
 // Pull Command
@@ -127,7 +141,7 @@ int cmd_pull(int argc, char *argv[]) {
         return 1;
     }
 
-    // Extract repository name from Url safely
+    // Extract repository name securely from URL (checking trailing suffix)
     const char *last_slash = strrchr(url, '/');
     if (!last_slash || *(last_slash + 1) == '\0') {
         fprintf(stderr, "[Dreams] Error: Invalid repository URL format.\n");
@@ -138,9 +152,9 @@ int cmd_pull(int argc, char *argv[]) {
     char repo_name[256];
     snprintf(repo_name, sizeof(repo_name), "%s", last_slash + 1);
 
-    char *ext = strstr(repo_name, ".git");
-    if (ext) {
-        *ext = '\0';
+    size_t len = strlen(repo_name);
+    if (len > 4 && strcmp(repo_name + len - 4, ".git") == 0) {
+        repo_name[len - 4] = '\0';
     }
 
     if (!is_valid_name(repo_name)) {
@@ -160,7 +174,12 @@ int cmd_pull(int argc, char *argv[]) {
                 free(home);
                 return 1;
             }
-            snprintf(target_path, sizeof(target_path), "%s/%s", home, argv[i + 1]);
+            int written = snprintf(target_path, sizeof(target_path), "%s/Dreams/%s", home, argv[i + 1]);
+            if (written < 0 || (size_t)written >= sizeof(target_path)) {
+                fprintf(stderr, "[Dreams] Error: Path too long.\n");
+                free(home);
+                return 1;
+            }
             custom_dir_specified = 1;
             break;
         }
@@ -169,22 +188,22 @@ int cmd_pull(int argc, char *argv[]) {
     char dreams_dir[PATH_MAX];
     snprintf(dreams_dir, sizeof(dreams_dir), "%s/Dreams", home);
     mkdir(dreams_dir, 0755);
+    if (getuid() == 0) chown(dreams_dir, uid, gid);
 
     if (!custom_dir_specified) {
         snprintf(target_path, sizeof(target_path), "%s/%s", dreams_dir, repo_name);
     }
 
-    // Safely remove existing target folder if present
+    // Safely remove existing target folder using lstat check
     struct stat st;
-    if (stat(target_path, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) {
+    if (lstat(target_path, &st) == 0) {
+        if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
             remove_directory(target_path);
         } else {
             unlink(target_path);
         }
     }
 
-    // Run git clone securely without shell injection risks
     printf("[Dreams] Cloning into %s...\n", target_path);
     char *const clone_argv[] = {"git", "clone", (char *)url, target_path, NULL};
     int status = run_cmd(clone_argv);
@@ -194,9 +213,8 @@ int cmd_pull(int argc, char *argv[]) {
         return status;
     }
 
-    // Fix ownership if run under sudo
     if (getuid() == 0) {
-        chown(target_path, uid, gid);
+        recursive_chown(target_path, uid, gid);
     }
 
     printf("[Dreams] Successfully pulled and stored in %s\n", target_path);
@@ -238,13 +256,21 @@ int cmd_cast(int store, int fresh) {
     char build_dir[PATH_MAX];
     snprintf(build_dir, sizeof(build_dir), "%s/build", workspace);
 
-    // Execute Clean if requested
+    // Execute Clean if requested (--fresh)
     if (fresh) {
         printf("[Dreams] Sweeping clean build artifacts (--fresh)...\n");
         remove_directory(build_dir);
+        if (is_makefile) {
+            char *const clean_argv[] = {"make", "clean", NULL};
+            run_cmd(clean_argv); // Ignore failure if clean target doesn't exist
+        }
     }
 
-    // Execute Build & Install securely
+    // Extract package name from workspace folder
+    const char *pkg_name = strrchr(workspace, '/');
+    if (pkg_name) pkg_name++;
+    else pkg_name = "unknown";
+
     if (is_cmake) {
         printf("[Dreams] Detected CMake build system.\n");
         mkdir(build_dir, 0755);
@@ -277,35 +303,29 @@ int cmd_cast(int store, int fresh) {
         }
     }
 
-    // Fix ownership of built/installed files if run under sudo
+    // Correct ownership of installed files if running under sudo
     if (getuid() == 0 && store) {
         char local_bin[PATH_MAX];
         snprintf(local_bin, sizeof(local_bin), "%s/.local/bin", home);
-        chown(local_bin, uid, gid);
+        recursive_chown(local_bin, uid, gid);
     }
 
-    // Write Manifest file for uninstall tracker
-    if (store) {
-        const char *repo_name = strrchr(workspace, '/');
-        if (repo_name) {
-            repo_name++;
-            if (is_valid_name(repo_name)) {
-                char manifest_dir[PATH_MAX];
-                snprintf(manifest_dir, sizeof(manifest_dir), "%s/.local/share/illus", home);
-                mkdir(manifest_dir, 0755);
+    // Write robust manifest file (tracking binary path, excluding self-reference)
+    if (store && is_valid_name(pkg_name)) {
+        char manifest_dir[PATH_MAX];
+        snprintf(manifest_dir, sizeof(manifest_dir), "%s/.local/share/illus", home);
+        mkdir(manifest_dir, 0755);
+        if (getuid() == 0) recursive_chown(manifest_dir, uid, gid);
 
-                char manifest_file_path[PATH_MAX];
-                snprintf(manifest_file_path, sizeof(manifest_file_path), "%s/%s.txt", manifest_dir, repo_name);
+        char manifest_file_path[PATH_MAX];
+        snprintf(manifest_file_path, sizeof(manifest_file_path), "%s/%s.txt", manifest_dir, pkg_name);
 
-                FILE *mf = fopen(manifest_file_path, "w");
-                if (mf) {
-                    fprintf(mf, "%s/.local/bin/%s\n", home, repo_name);
-                    fprintf(mf, "%s\n", manifest_file_path);
-                    fclose(mf);
-                    if (getuid() == 0) chown(manifest_file_path, uid, gid);
-                    printf("[Dreams] Manifest created for package: %s\n", repo_name);
-                }
-            }
+        FILE *mf = fopen(manifest_file_path, "w");
+        if (mf) {
+            fprintf(mf, "%s/.local/bin/%s\n", home, pkg_name);
+            fclose(mf);
+            if (getuid() == 0) chown(manifest_file_path, uid, gid);
+            printf("[Dreams] Manifest created for package: %s\n", pkg_name);
         }
     }
 
@@ -351,19 +371,34 @@ int cmd_update(void) {
             found_repos = 1;
             printf("[Dreams] Updating project: %s\n", entry->d_name);
 
+            char cwd_buf[PATH_MAX];
+            if (!getcwd(cwd_buf, sizeof(cwd_buf))) continue;
+
             if (chdir(repo_path) == 0) {
                 char *const pull_argv[] = {"git", "pull", NULL};
                 if (run_cmd(pull_argv) != 0) {
                     printf("[Dreams] Error: 'git pull' failed for %s.\n", entry->d_name);
                     failures++;
+                    chdir(cwd_buf);
                     continue;
                 }
 
-                // Re-cast / rebuild
-                if (cmd_cast(1, 0) != 0) {
-                    printf("[Dreams] Error: Rebuild/install failed for %s.\n", entry->d_name);
-                    failures++;
+                // Check if build system exists before casting
+                char cmake_path[PATH_MAX], makefile_path[PATH_MAX];
+                snprintf(cmake_path, sizeof(cmake_path), "%s/CMakeLists.txt", repo_path);
+                snprintf(makefile_path, sizeof(makefile_path), "%s/Makefile", repo_path);
+
+                if (access(cmake_path, F_OK) == 0 || access(makefile_path, F_OK) == 0) {
+                    if (cmd_cast(1, 0) != 0) {
+                        printf("[Dreams] Error: Rebuild/install failed for %s.\n", entry->d_name);
+                        failures++;
+                    } else {
+                        printf("[Dreams] Successfully updated and rebuilt %s!\n\n", entry->d_name);
+                    }
+                } else {
+                    printf("[Dreams] Pulled latest changes for %s (no Makefile/CMakeLists.txt found, skipping build).\n\n", entry->d_name);
                 }
+                chdir(cwd_buf);
             }
         }
     }
@@ -385,11 +420,11 @@ int cmd_version(void) {
     printf("  | || | | |_| \\__ \\ \n");
     printf(" |___|_|_|\\__,_|___/ \n\n");
     printf("\033[0m");
-    printf(" ✦ Dreams Package Manager (illus) v1.0.0✦\n");
+    printf(" ✦ Dreams Package Manager (illus) v%s ✦\n", ILLUS_VERSION);
     return 0;
 }
 
-// Shed Command
+// Shed Command (with realpath validation to prevent path traversal)
 int cmd_shed(const char *package_name) {
     if (!is_valid_name(package_name)) {
         fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n", package_name);
@@ -429,13 +464,30 @@ int cmd_shed(const char *package_name) {
     }
 
     char line[PATH_MAX];
+    char resolved_home[PATH_MAX];
+    if (!realpath(home, resolved_home)) {
+        fclose(f);
+        free(home);
+        return 1;
+    }
+
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
         if (strlen(line) == 0) continue;
 
-        printf("[Dreams] Removing file: %s\n", line);
-        if (remove(line) != 0) {
-            perror("[Dreams] Warning: Could not remove file");
+        // Security check: validate file path resolves strictly inside user's home/.local
+        char resolved_target[PATH_MAX];
+        if (realpath(line, resolved_target)) {
+            char local_prefix[PATH_MAX];
+            snprintf(local_prefix, sizeof(local_prefix), "%s/.local", resolved_home);
+            if (strncmp(resolved_target, local_prefix, strlen(local_prefix)) == 0) {
+                printf("[Dreams] Removing file: %s\n", resolved_target);
+                if (remove(resolved_target) != 0) {
+                    perror("[Dreams] Warning: Could not remove file");
+                }
+            } else {
+                fprintf(stderr, "[Dreams] Error: Refusing to delete file outside .local: %s\n", line);
+            }
         }
     }
     fclose(f);
@@ -499,7 +551,7 @@ void print_help(const char *program_name) {
     printf("  | || | | |_| \\__ \\ \n");
     printf(" |___|_|_|\\__,_|___/ \n\n");
     printf("\033[0m");
-    printf(" ✦ Dreams Package Manager (illus) v1.0.0✦\n\n");
+    printf(" ✦ Dreams Package Manager (illus) v%s ✦\n\n", ILLUS_VERSION);
     printf("Usage:\n");
     printf("  %s --pull {Url}              Clone repository into ~/Dreams\n", program_name);
     printf("  %s --dir {path}              Specify custom directory for --pull (Used with --pull)\n", program_name);
@@ -508,6 +560,6 @@ void print_help(const char *program_name) {
     printf("  %s --cast --fresh            Clean build artifacts and build fresh\n", program_name);
     printf("  %s --shed [Package]          Uninstall package and its tracked files\n", program_name);
     printf("  %s --update                  Update all repositories in ~/Dreams\n", program_name);
-    printf("  %s --list                    List all repositories in ~/Dreams\n", program_name);
+    printf("  %s --list                    List installed binaries in ~/.local/bin\n", program_name);
     printf("  %s --version                 Show version information\n", program_name);
 }
