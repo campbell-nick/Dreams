@@ -36,7 +36,6 @@ running `make install` yourself.
   malicious local process racing symlinks inside `~/.local`.
 - `~/.local` and the home directory are assumed to be real directories, not
   symlinks.
-Two wording choices worth keeping: explain why root is unsafe (scripts still run as root), and frame the limitations as "best-effort" rather than implying guarantees.
 
 ## Features
 
