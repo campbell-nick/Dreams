@@ -30,6 +30,7 @@ typedef struct {
     const char *configure_args;
     const char *make_args;
     const char *sha256;
+    const char *log_file;
 } illus_options;
 
 int cmd_pull(const illus_options *opts, const char *url);

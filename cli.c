@@ -41,12 +41,13 @@ typedef enum {
     OPT_CONFIGURE_ARGS,
     OPT_MAKE_ARGS,
     OPT_SHA256,
+    OPT_LOG_FILE,
     OPT_HELP,
     OPT_COUNT
 } opt_id;
 
 #define OPT_BIT(x) (1ULL << (x))
-#define OPT_COMMON (OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_HELP))
+#define OPT_COMMON (OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_HELP) | OPT_BIT(OPT_LOG_FILE))
 
 typedef struct {
     const char *name;
@@ -76,6 +77,7 @@ static const opt_def option_defs[] = {
     {"configure-args",  OPT_CONFIGURE_ARGS,  1},
     {"make-args",       OPT_MAKE_ARGS,       1},
     {"sha256",          OPT_SHA256,          1},
+    {"log-file",        OPT_LOG_FILE,        1},
     {"help",            OPT_HELP,            0},
     {NULL,              OPT_COUNT,           0}
 };
@@ -288,6 +290,9 @@ static int apply_value(cli_parsed *parsed, opt_id id, const char *value) {
     case OPT_SHA256:
         parsed->opts.sha256 = value;
         return 0;
+    case OPT_LOG_FILE:
+        parsed->opts.log_file = value;
+        return 0;
     default:
         return -1;
     }
@@ -480,6 +485,7 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
         printf("  --make-args <a>      Extra arguments for make\n");
         printf("  --sha256 <hex>       SHA-256 for a tarball URL install\n");
+        printf("  --log-file <path>    Tee command output to this file\n");
         printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
         printf("  --dry-run            Show what would happen without changing anything\n");
         break;

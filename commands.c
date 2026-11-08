@@ -31,6 +31,7 @@
 /* ------------------------------------------------------------------------- */
 
 static int g_verbose = 0;
+static const char *g_log_file = NULL;
 
 static void print_command(char *const argv[]) {
     int i;
@@ -60,6 +61,72 @@ static int run_cmd(char *const argv[]) {
     int status;
 
     print_command(argv);
+
+    if (g_log_file) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            perror("[Dreams] Error: pipe failed");
+            return -1;
+        }
+        FILE *lf = fopen(g_log_file, "a");
+        if (!lf) {
+            perror("[Dreams] Error: could not open log file");
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return -1;
+        }
+        fprintf(lf, "+");
+        for (int i = 0; argv && argv[i]; i++) fprintf(lf, " %s", argv[i]);
+        fprintf(lf, "\n");
+        fflush(lf);
+
+        fflush(NULL);
+        pid = fork();
+        if (pid < 0) {
+            perror("[Dreams] Error: fork failed");
+            fclose(lf);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return -1;
+        }
+        if (pid == 0) {
+            close(pipefd[0]);
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[1]);
+            execvp(argv[0], argv);
+            perror("[Dreams] Error: execvp failed");
+            _exit(127);
+        }
+        close(pipefd[1]);
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(pipefd[0], buf, sizeof buf)) > 0) {
+            fwrite(buf, 1, (size_t)n, stdout);
+            fwrite(buf, 1, (size_t)n, lf);
+            fflush(stdout);
+            fflush(lf);
+        }
+        close(pipefd[0]);
+        if (waitpid(pid, &status, 0) < 0) {
+            perror("[Dreams] Error: waitpid failed");
+            fclose(lf);
+            return -1;
+        }
+        fclose(lf);
+        if (WIFEXITED(status)) {
+            int code = WEXITSTATUS(status);
+            if (code != 0) {
+                print_command_failure(argv, code);
+                fprintf(stderr, "[Dreams] Full output logged to: %s\n", g_log_file);
+            }
+            return code;
+        }
+        fprintf(stderr, "[Dreams] Command terminated abnormally: %s\n",
+                argv && argv[0] ? argv[0] : "?");
+        return -1;
+    }
+
     fflush(NULL);
     pid = fork();
     if (pid < 0) {
@@ -1567,21 +1634,21 @@ static int git_clone(const illus_options *opts, const char *url,
     if (cgc_preferred(url, opts)) {
         char *cargv[8];
         char depth_buf[32];
-        int n = 0;
+        int cn = 0;
 
-        cargv[n++] = "cgc";
+        cargv[cn++] = "cgc";
         if (opts->branch && *opts->branch) {
-            cargv[n++] = "-b";
-            cargv[n++] = (char *)opts->branch;
+            cargv[cn++] = "-b";
+            cargv[cn++] = (char *)opts->branch;
         }
         if (opts->depth > 0) {
-            cargv[n++] = "--depth";
+            cargv[cn++] = "--depth";
             snprintf(depth_buf, sizeof depth_buf, "%d", opts->depth);
-            cargv[n++] = depth_buf;
+            cargv[cn++] = depth_buf;
         }
-        cargv[n++] = (char *)url;
-        cargv[n++] = (char *)target;
-        cargv[n] = NULL;
+        cargv[cn++] = (char *)url;
+        cargv[cn++] = (char *)target;
+        cargv[cn] = NULL;
         return run_cmd(cargv);
     }
 
@@ -1945,6 +2012,8 @@ static int resolve_pull_target(const illus_options *opts, const char *home,
 /* ------------------------------------------------------------------------- */
 
 int cmd_pull(const illus_options *opts, const char *url) {
+    if (opts && opts->verbose) g_verbose = 1;
+    if (opts && opts->log_file) g_log_file = opts->log_file;
     uid_t uid = 0;
     gid_t gid = 0;
     char *home;
@@ -2098,6 +2167,7 @@ int cmd_cast(const illus_options *opts) {
     manifest_meta meta;
 
     if (opts && opts->verbose) g_verbose = 1;
+    if (opts && opts->log_file) g_log_file = opts->log_file;
     if (refuse_root(opts->store ? "cast --store" : "cast")) return 1;
 
     home = get_real_home(&uid, &gid);
@@ -2698,6 +2768,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
     int rc;
 
     if (opts && opts->verbose) g_verbose = 1;
+    if (opts && opts->log_file) g_log_file = opts->log_file;
     if (refuse_root("install")) return 1;
     if (!spec || !*spec) {
         fprintf(stderr, "[Dreams] Error: install requires a repository or tarball URL.\n");
@@ -2964,6 +3035,7 @@ int cmd_upgrade(const illus_options *opts, const char *package_name) {
     illus_options iopts;
 
     if (opts && opts->verbose) g_verbose = 1;
+    if (opts && opts->log_file) g_log_file = opts->log_file;
     if (refuse_root("upgrade")) return 1;
     if (!is_valid_name(package_name)) {
         fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n",
