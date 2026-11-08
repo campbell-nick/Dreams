@@ -2,6 +2,8 @@
 
 ✦ Dreams Package Manager (illus) v1.0.0 ✦
 
+[![CI](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml/badge.svg)](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml)
+
 A lightweight, stateless C package manager that builds and installs software
 into user space (`~/.local/`). It is sudo-aware when resolving the real user's
 home directory, but package operations should not be run as root.

@@ -19,6 +19,13 @@ If that name is not a valid single path component, or is too long to form
 shown. Rebuilding a package re-reads its existing manifest, so files from the
 previous version remain tracked.
 
+Set `ILLUS_HOME` to an absolute path to use a different home directory, which
+is useful for tests or isolated installs:
+
+```bash
+ILLUS_HOME=/tmp/illus-home illus --list
+```
+
 ## Basic Usage
 
 ### Cloning repositories

@@ -68,7 +68,15 @@ static int run_cmd_with_destdir(char *const argv[], const char *destdir) {
 static char *get_real_home(uid_t *out_uid, gid_t *out_gid) {
     uid_t uid = getuid();
     const char *sudo_user = getenv("SUDO_USER");
+    const char *override = getenv("ILLUS_HOME");
     struct passwd *pw = NULL;
+
+    /* ILLUS_HOME is intended for tests and isolated installs. */
+    if (override && *override) {
+        if (out_uid) *out_uid = getuid();
+        if (out_gid) *out_gid = getgid();
+        return strdup(override);
+    }
 
     if (uid == 0 && sudo_user) {
         pw = getpwnam(sudo_user);
@@ -157,6 +165,24 @@ static int is_within(const char *path, const char *root) {
 
     if (strncmp(path, root, n) != 0) return 0;
     return path[n] == '\0' || path[n] == '/';
+}
+
+/* Like is_within, but resolve root first (e.g. /etc -> /private/etc). */
+static int is_within_real(const char *path, const char *root) {
+    char resolved[PATH_MAX];
+
+    if (realpath(root, resolved)) {
+        return is_within(path, resolved);
+    }
+    return is_within(path, root);
+}
+
+/* True when path is inside root but is not root itself. */
+static int is_inside_real(const char *path, const char *root) {
+    char resolved[PATH_MAX];
+
+    if (!realpath(root, resolved)) return 0;
+    return is_within(path, resolved) && strcmp(path, resolved) != 0;
 }
 
 /* Reject any path containing a ".." component. */
@@ -260,8 +286,8 @@ static int is_protected_target(const char *target, const char *home) {
 static int replace_allowed(const char *target, const char *home) {
     if (strcmp(target, "/") == 0 || strcmp(target, home) == 0) return 0;
     if (is_within(target, home)) return 1;
-    if (is_within(target, "/tmp") && strcmp(target, "/tmp") != 0) return 1;
-    if (is_within(target, "/var/tmp") && strcmp(target, "/var/tmp") != 0) return 1;
+    if (is_inside_real(target, "/tmp")) return 1;
+    if (is_inside_real(target, "/var/tmp")) return 1;
     return 0;
 }
 
@@ -274,10 +300,10 @@ static int is_system_area(const char *path) {
     size_t i;
 
     /* /var/tmp is a legitimate scratch destination; the rest of /var is not. */
-    if (is_within(path, "/var/tmp")) return 0;
-    if (is_within(path, "/var")) return 1;
+    if (is_within_real(path, "/var/tmp")) return 0;
+    if (is_within_real(path, "/var")) return 1;
     for (i = 0; roots[i] != NULL; i++) {
-        if (is_within(path, roots[i])) return 1;
+        if (is_within_real(path, roots[i])) return 1;
     }
     return 0;
 }
