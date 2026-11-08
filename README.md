@@ -1,6 +1,6 @@
 # Illution (illus)
 
-✦ Dreams Package Manager (illus) v1.3.0 ✦
+✦ Dreams Package Manager (illus) v1.3.0(dev) ✦
 
 [![CI](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml/badge.svg)](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml)
 

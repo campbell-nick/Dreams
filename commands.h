@@ -1,7 +1,7 @@
 #ifndef COMMANDS_H
 #define COMMANDS_H
 
-#define ILLUS_VERSION "1.3.0"
+#define ILLUS_VERSION "1.3.0(dev)"
 
 /*
  * Parsed command-line options. The CLI layer fills this in once and every
