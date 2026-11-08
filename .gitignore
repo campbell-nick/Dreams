@@ -1,3 +1,5 @@
 illus
 build/
+build2/
+tests/unit
 .DS_Store
