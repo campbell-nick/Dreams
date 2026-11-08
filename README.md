@@ -79,4 +79,6 @@ Make sure `~/.local/bin` is on your `PATH`. The original flags still work:
 | [Warnings and safety](docs/Warnings.md) | Risk warning, safe-usage rules, known limitations |
 | [Installation](docs/Installation.md) | Requirements, building/installing `illus`, removing it |
 | [Usage](docs/Usage.md) | Commands, manifests, paths, exit status |
+| [Compatibility and releases](docs/Compatibility.md) | Distro notes, manifest compatibility, rollback/releases |
 | [Troubleshooting](docs/Troubleshooting.md) | Common errors, `illus doctor`, fixes |
+| [Changelog](CHANGELOG.md) | Release notes and behavior changes |

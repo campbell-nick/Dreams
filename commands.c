@@ -3718,6 +3718,31 @@ int cmd_doctor(const illus_options *opts) {
     }
 
     {
+        const char *found = NULL;
+        char path[PATH_MAX];
+
+        if (find_in_path("curl", path, sizeof path) == 0) found = "curl";
+        else if (find_in_path("wget", path, sizeof path) == 0) found = "wget";
+        if (found) {
+            doctor_emit(&state, "pass", "download tool available", found);
+        } else {
+            doctor_emit(&state, "warn", "download tool available",
+                        "curl or wget needed for remote tarballs");
+        }
+
+        found = NULL;
+        if (find_in_path("sha256sum", path, sizeof path) == 0) found = "sha256sum";
+        else if (find_in_path("shasum", path, sizeof path) == 0) found = "shasum";
+        else if (find_in_path("openssl", path, sizeof path) == 0) found = "openssl";
+        if (found) {
+            doctor_emit(&state, "pass", "SHA-256 tool available", found);
+        } else {
+            doctor_emit(&state, "warn", "SHA-256 tool available",
+                        "sha256sum, shasum, or openssl needed for tarball verification");
+        }
+    }
+
+    {
         DIR *d = opendir(manifest_dir);
 
         if (!d) {

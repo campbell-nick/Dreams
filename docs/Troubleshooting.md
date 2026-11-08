@@ -12,7 +12,7 @@ illus doctor --verbose
 
 `doctor` checks the home directory, root status, `~/.local` ownership and
 permissions, `PATH`, required tools, manifest integrity, unsafe entries, stale
-staging directories, untracked binaries, and the registry configuration.
+staging directories, and untracked binaries.
 
 ## Common errors
 
@@ -52,16 +52,22 @@ staging directories, untracked binaries, and the registry configuration.
 - **`could not update <path>`** — `git pull --ff-only` failed. The clone has
   local changes or has diverged from the remote. Commit/stash/reset the clone,
   or use `install --force` to replace it.
-- **`package '<name>' was not found in the registry`** — check `illus search`,
-  pass a repository URL instead, or point `ILLUS_REGISTRY` / `--registry` at
-  the right registry.
-- **`could not fetch registry`** — the registry URL is unreachable, or `git` is
-  not installed. Check `git --version` and the URL. A cached registry is reused
-  when a refresh fails.
+- **`name-based install was removed; '<name>' is not a URL`** — `illus install`
+  is URL-first. Pass a git or tarball URL, for example
+  `illus install https://github.com/owner/repo.git`.
+- **`tarball installs require --sha256 <64-char hex>`** — direct tarball
+  installs must be checksum-verified. Obtain the expected SHA-256 from the
+  project’s release and pass `--sha256 <hex>`.
+- **`SHA-256 mismatch`** — the downloaded archive does not match the expected
+  checksum. Do not install it; verify the URL and checksum from a trusted
+  source.
+- **`configure is missing and autoreconf is not installed`** — install
+  Autotools (`autoconf`, `automake`, `libtool`/`autoreconf`) or use a release
+  tarball that ships `configure`.
 - **`invalid repository URL`** — URLs and paths must not start with `-` or
   contain whitespace or control characters. Use `--` before a URL that begins
   with `-` if you really need to, or use `--name`.
-- **`could not derive a repository name from the URL`** — pass `--name <pkg>`
+- **`could not derive a package name from the URL`** — pass `--name <pkg>`
   to choose the destination/manifest name explicitly.
 - **`cannot determine a valid package name`** — the current directory name is
   not a valid single path component (for example it starts with `.` or `-`).
@@ -71,12 +77,10 @@ staging directories, untracked binaries, and the registry configuration.
 
 - `~/.local/.illus-stage-*` — temporary staging directories from a crash; safe
   to delete when no `illus` command is running.
-- `~/Dreams/.illus-clone-*` — temporary clone directories from an interrupted
-  pull; safe to delete when no `illus` command is running.
+- `~/Dreams/.illus-clone-*` — temporary clone/download directories from an
+  interrupted fetch; safe to delete when no `illus` command is running.
 - `~/Dreams/.illus-old-*` — backup directories from an interrupted `--force`
   replacement. Check that the destination is correct before deleting one.
-- `~/.cache/illus/registry/` — the cached git registry. Delete it to force a
-  fresh clone on the next registry command, or run `illus search --refresh`.
 
 ## See also
 

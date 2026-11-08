@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  release:
+    name: Create release
+    needs: test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build checksums for source tree
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="illus-${TAG}/" -o "illus-${TAG}.tar.gz" "${TAG}"
+          sha256sum "illus-${TAG}.tar.gz" > "illus-${TAG}.tar.gz.sha256"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          PRERELEASE=""
+          case "$TAG" in
+            *-dev*|*-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "illus-${TAG}.tar.gz" "illus-${TAG}.tar.gz.sha256" --clobber
+          else
+            gh release create "$TAG" "illus-${TAG}.tar.gz" "illus-${TAG}.tar.gz.sha256" \
+              --generate-notes $PRERELEASE \
+              --title "illus ${TAG}"
+          fi
