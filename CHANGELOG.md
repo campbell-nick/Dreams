@@ -13,6 +13,7 @@ This project aims to follow [Semantic Versioning](https://semver.org/) for tagge
 ### Changed
 - **URL-first installs**: `illus install` now takes a git or tarball URL/path. Tarball URLs require `--sha256`.
 - **`pull` default destination**: `illus pull <url>` now clones into `./<repo-name>` in the current directory (like `git clone`), instead of `~/Dreams/<repo>`. Use `--dir ~/Dreams/<name>` to restore the old behavior.
+- **Clone tool preference**: `illus` now prefers `cgc` (when available on `PATH`) for HTTPS clones, falling back to `git clone` otherwise. `git` is still required for updates (`git pull --ff-only`) and non-HTTP transports.
 - `info` reports installed manifest details only.
 
 ### Removed

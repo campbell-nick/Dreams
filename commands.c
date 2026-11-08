@@ -1536,11 +1536,44 @@ static int track_install(const char *home, const char *pkg_name, const char *sta
 /* Git helpers                                                               */
 /* ------------------------------------------------------------------------- */
 
+/* True when the optional cgc clone tool should be used for this URL. */
+static int cgc_preferred(const char *url, const illus_options *opts) {
+    if (!tool_available("cgc")) return 0;
+    if (!url || !*url) return 0;
+    /* cgc cannot honor these git clone options. */
+    if (opts && (opts->depth > 0 || (opts->branch && *opts->branch) ||
+                 opts->recursive)) {
+        return 0;
+    }
+    /* Local filesystem paths must use git. */
+    if (url[0] == '/' || url[0] == '~' ||
+        strncmp(url, "./", 2) == 0 || strncmp(url, "../", 3) == 0) {
+        return 0;
+    }
+    if (access(url, F_OK) == 0) return 0;
+    /* Transports cgc does not support. */
+    if (strncmp(url, "ssh://", 6) == 0 || strncmp(url, "git://", 6) == 0) {
+        return 0;
+    }
+    if (strstr(url, "git@") != NULL) return 0;
+    return 1;
+}
+
 static int git_clone(const illus_options *opts, const char *url,
                      const char *target) {
     char *argv[16];
     char depth[32];
     int n = 0;
+
+    if (cgc_preferred(url, opts)) {
+        char *cargv[4];
+
+        cargv[0] = "cgc";
+        cargv[1] = (char *)url;
+        cargv[2] = (char *)target;
+        cargv[3] = NULL;
+        return run_cmd(cargv);
+    }
 
     argv[n++] = "git";
     argv[n++] = "clone";
@@ -3926,6 +3959,8 @@ static void doctor_emit(doctor_state *state, const char *status,
             printf("  [ OK ] %s", check);
         } else if (strcmp(status, "warn") == 0) {
             printf("  [WARN] %s", check);
+        } else if (strcmp(status, "info") == 0) {
+            printf("  [INFO] %s", check);
         } else {
             printf("  [FAIL] %s", check);
         }
@@ -4072,6 +4107,14 @@ int cmd_doctor(const illus_options *opts) {
         } else {
             doctor_emit(&state, "warn", "ninja available",
                         "often used by Meson/CMake builds");
+        }
+
+        if (find_in_path("cgc", path, sizeof path) == 0) {
+            doctor_emit(&state, "pass", "cgc available",
+                        "preferred clone tool (HTTPS)");
+        } else {
+            doctor_emit(&state, "info", "cgc available",
+                        "optional; git is used when absent");
         }
     }
 
