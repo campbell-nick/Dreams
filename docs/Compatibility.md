@@ -28,7 +28,7 @@ Common requirements:
 
 | Need | Tools |
 | --- | --- |
-| Git sources | `git` |
+| Git sources | `git` (required); [`cgc`](https://github.com/campbell-nick/CGC) is optional and preferred for HTTPS clones when available |
 | Build | `make`, and/or `cmake`, and/or Autotools (`autoreconf`, `autoconf`, `automake`, `libtool`) depending on the package |
 | Tarballs | `tar` (and compression support as needed), `curl` or `wget`, `sha256sum`/`shasum`/`openssl` |
 | Archives | `unzip` for `.zip` |

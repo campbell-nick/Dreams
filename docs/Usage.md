@@ -61,7 +61,8 @@ illus install <tarball-url> --name <package> --sha256 <hex>
 `install` fetches the source into `~/Dreams/<name>` (or `--dir`), builds it,
 and installs it with `DESTDIR` staging.
 
-When cloning git sources, `illus` prefers `cgc` (if available on `PATH`) for
+When cloning git sources, `illus` prefers
+[`cgc`](https://github.com/campbell-nick/CGC) (if available on `PATH`) for
 HTTPS URLs and falls back to `git clone` otherwise. `git` is still required for
 updating existing clones (`git pull --ff-only`) and for local/SSH transports.
 

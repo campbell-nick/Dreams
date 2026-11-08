@@ -7,6 +7,10 @@
 - Linux or macOS (other POSIX systems may work; Windows is not currently supported)
 - A C99 compiler (GCC or Clang)
 - `git` for git URL installs, `pull`, and `update`
+- Optional but recommended: [`cgc`](https://github.com/campbell-nick/CGC) for
+  faster HTTPS clones. When `cgc` is on `PATH`, `illus` prefers it for HTTPS
+  URLs and falls back to `git clone` otherwise. `git` is still required for
+  updating existing clones and for local/SSH transports.
 - Build tools as needed by packages: `make`, `cmake`, and/or Autotools
   (`autoconf`, `automake`, `libtool`/`autoreconf`) for projects that need
   bootstrapping
