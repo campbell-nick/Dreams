@@ -1540,9 +1540,8 @@ static int track_install(const char *home, const char *pkg_name, const char *sta
 static int cgc_preferred(const char *url, const illus_options *opts) {
     if (!tool_available("cgc")) return 0;
     if (!url || !*url) return 0;
-    /* cgc cannot honor these git clone options. */
-    if (opts && (opts->depth > 0 || (opts->branch && *opts->branch) ||
-                 opts->recursive)) {
+    /* cgc cannot honor submodule recursion yet. */
+    if (opts && opts->recursive) {
         return 0;
     }
     /* Local filesystem paths must use git. */
