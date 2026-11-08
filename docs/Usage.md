@@ -89,6 +89,8 @@ Useful options:
 | `--configure-args <args>` | Extra arguments for `./configure` (Autotools) |
 | `--make-args <args>` | Extra arguments for `make` |
 | `--sha256 <hex>` | SHA-256 for a tarball URL install |
+| `--token <tok>` | Bearer token for private HTTPS repos (forwarded to cgc) |
+| `--log-file <path>` | Tee command output to this file |
 | `--allow-untracked` | Accept an install that ignores `DESTDIR` |
 | `--dry-run` | Show what would happen without changing anything |
 
