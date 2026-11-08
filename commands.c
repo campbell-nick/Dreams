@@ -344,7 +344,7 @@ static char *get_real_home(uid_t *out_uid, gid_t *out_gid) {
 }
 
 /* Strictly validate a single path component used as a repo/package name. */
-static int is_valid_name(const char *name) {
+int is_valid_name(const char *name) {
     size_t i;
 
     if (!name || !*name) return 0;
@@ -362,7 +362,7 @@ static int is_valid_name(const char *name) {
 }
 
 /* Join two path components, adding a slash only when needed. */
-static int path_join(char *out, size_t size, const char *a, const char *b) {
+int path_join(char *out, size_t size, const char *a, const char *b) {
     size_t la, lb, off;
     int slash;
 
@@ -380,7 +380,7 @@ static int path_join(char *out, size_t size, const char *a, const char *b) {
 }
 
 /* Build "stem + suffix" without relying on printf truncation rules. */
-static int make_filename(char *out, size_t size, const char *stem, const char *suffix) {
+int make_filename(char *out, size_t size, const char *stem, const char *suffix) {
     size_t a = strlen(stem);
     size_t b = strlen(suffix);
 
@@ -391,7 +391,7 @@ static int make_filename(char *out, size_t size, const char *stem, const char *s
 }
 
 /* Get the parent directory of an absolute path. */
-static int parent_dir(const char *path, char *out, size_t size) {
+int parent_dir(const char *path, char *out, size_t size) {
     const char *slash = strrchr(path, '/');
     size_t len;
 
@@ -410,7 +410,7 @@ static int parent_dir(const char *path, char *out, size_t size) {
 }
 
 /* True when path is root itself or is inside root. */
-static int is_within(const char *path, const char *root) {
+int is_within(const char *path, const char *root) {
     size_t n = strlen(root);
 
     if (strncmp(path, root, n) != 0) return 0;
@@ -418,7 +418,7 @@ static int is_within(const char *path, const char *root) {
 }
 
 /* Like is_within, but resolve root first (e.g. /etc -> /private/etc). */
-static int is_within_real(const char *path, const char *root) {
+int is_within_real(const char *path, const char *root) {
     char resolved[PATH_MAX];
 
     if (realpath(root, resolved)) {
@@ -428,7 +428,7 @@ static int is_within_real(const char *path, const char *root) {
 }
 
 /* True when path is inside root but is not root itself. */
-static int is_inside_real(const char *path, const char *root) {
+int is_inside_real(const char *path, const char *root) {
     char resolved[PATH_MAX];
 
     if (!realpath(root, resolved)) return 0;
@@ -436,7 +436,7 @@ static int is_inside_real(const char *path, const char *root) {
 }
 
 /* Reject any path containing a ".." component. */
-static int has_dotdot(const char *path) {
+int has_dotdot(const char *path) {
     const char *p = path;
 
     while (*p) {
@@ -452,7 +452,7 @@ static int has_dotdot(const char *path) {
 }
 
 /* Expand "~", "~/..." or turn a relative path into an absolute one. */
-static char *expand_path(const char *input, const char *home) {
+char *expand_path(const char *input, const char *home) {
     char buf[PATH_MAX];
     size_t len;
 
@@ -477,7 +477,7 @@ static char *expand_path(const char *input, const char *home) {
 }
 
 /* mkdir -p implementation. */
-static int mkdir_p(const char *path, mode_t mode) {
+int mkdir_p(const char *path, mode_t mode) {
     char tmp[PATH_MAX];
     size_t len;
     char *p;
@@ -502,7 +502,7 @@ static int mkdir_p(const char *path, mode_t mode) {
 }
 
 /* Refuse a handful of destinations that would be catastrophic to replace. */
-static int is_protected_target(const char *target, const char *home) {
+int is_protected_target(const char *target, const char *home) {
     static const char *names[] = {
         "", ".local", ".local/bin", ".local/lib", ".local/share",
         ".ssh", ".config", "Dreams", NULL
@@ -533,7 +533,7 @@ static int is_protected_target(const char *target, const char *home) {
 }
 
 /* Allow a --force replacement only inside home or the temp directories. */
-static int replace_allowed(const char *target, const char *home) {
+int replace_allowed(const char *target, const char *home) {
     if (strcmp(target, "/") == 0 || strcmp(target, home) == 0) return 0;
     if (is_within(target, home)) return 1;
     if (is_inside_real(target, "/tmp")) return 1;
@@ -542,7 +542,7 @@ static int replace_allowed(const char *target, const char *home) {
 }
 
 /* System areas that should never receive a package clone. */
-static int is_system_area(const char *path) {
+int is_system_area(const char *path) {
     static const char *roots[] = {
         "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
         "/proc", "/root", "/run", "/sbin", "/sys", "/usr", NULL
@@ -563,7 +563,7 @@ static int is_system_area(const char *path) {
  * it lands in a system area. This must run before mkdir_p so a symlinked
  * component cannot make us create directories inside /etc, /usr, etc.
  */
-static int check_existing_ancestor(const char *path, const char *home) {
+int check_existing_ancestor(const char *path, const char *home) {
     char probe[PATH_MAX];
     char resolved[PATH_MAX];
     size_t len;
@@ -941,7 +941,7 @@ static int has_suffix(const char *text, const char *suffix) {
     return a >= b && strcmp(text + a - b, suffix) == 0;
 }
 
-static int url_is_tarball(const char *url) {
+int url_is_tarball(const char *url) {
     static const char *exts[] = {
         ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
         ".tar.zst", ".tzst", ".tar", ".zip", NULL
@@ -964,7 +964,7 @@ static int url_is_tarball(const char *url) {
     return 0;
 }
 
-static size_t strip_archive_suffix(char *name, size_t len) {
+size_t strip_archive_suffix(char *name, size_t len) {
     static const char *exts[] = {
         ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
         ".tar.zst", ".tzst", ".tar", ".zip", NULL
@@ -1645,6 +1645,10 @@ static int git_clone(const illus_options *opts, const char *url,
             cargv[cn++] = "--depth";
             snprintf(depth_buf, sizeof depth_buf, "%d", opts->depth);
             cargv[cn++] = depth_buf;
+        }
+        if (opts->token && *opts->token) {
+            cargv[cn++] = "--token";
+            cargv[cn++] = (char *)opts->token;
         }
         cargv[cn++] = (char *)url;
         cargv[cn++] = (char *)target;

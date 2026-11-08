@@ -42,12 +42,13 @@ typedef enum {
     OPT_MAKE_ARGS,
     OPT_SHA256,
     OPT_LOG_FILE,
+    OPT_TOKEN,
     OPT_HELP,
     OPT_COUNT
 } opt_id;
 
 #define OPT_BIT(x) (1ULL << (x))
-#define OPT_COMMON (OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_HELP) | OPT_BIT(OPT_LOG_FILE))
+#define OPT_COMMON (OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_HELP) | OPT_BIT(OPT_LOG_FILE) | OPT_BIT(OPT_TOKEN))
 
 typedef struct {
     const char *name;
@@ -78,6 +79,7 @@ static const opt_def option_defs[] = {
     {"make-args",       OPT_MAKE_ARGS,       1},
     {"sha256",          OPT_SHA256,          1},
     {"log-file",        OPT_LOG_FILE,        1},
+    {"token",           OPT_TOKEN,           1},
     {"help",            OPT_HELP,            0},
     {NULL,              OPT_COUNT,           0}
 };
@@ -292,6 +294,9 @@ static int apply_value(cli_parsed *parsed, opt_id id, const char *value) {
         return 0;
     case OPT_LOG_FILE:
         parsed->opts.log_file = value;
+        return 0;
+    case OPT_TOKEN:
+        parsed->opts.token = value;
         return 0;
     default:
         return -1;
