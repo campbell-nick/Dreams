@@ -18,6 +18,10 @@ $(TARGET): $(SOURCES) $(HEADERS)
 check: $(TARGET)
 	sh tests/integration.sh ./$(TARGET)
 
+unit: $(TARGET)
+	$(CC) $(CFLAGS) -std=c99 -I. tests/unit.c commands.c -o tests/unit
+	./tests/unit
+
 install: $(TARGET)
 	@test -n "$(PREFIX)" || { echo "install: PREFIX must not be empty" >&2; exit 1; }
 	install -d $(DESTDIR)$(PREFIX)/bin

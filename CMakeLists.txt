@@ -31,4 +31,8 @@ if(BUILD_TESTING)
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.sh $<TARGET_FILE:illus>
     )
     set_tests_properties(illus.integration PROPERTIES TIMEOUT 300)
+
+    add_executable(illus_unit tests/unit.c commands.c)
+    target_include_directories(illus_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME illus.unit COMMAND illus_unit)
 endif()
