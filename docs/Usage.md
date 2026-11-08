@@ -29,6 +29,7 @@ ILLUS_HOME=/tmp/illus-home illus list
 
 ```text
 illus install <url>        Fetch, build, and install a package
+illus upgrade <name>       Reinstall an installed package from its recorded source
 illus remove <name>...     Uninstall packages (aliases: shed, uninstall)
 illus list                 List installed packages
 illus info <name>          Show details for an installed package
@@ -78,7 +79,7 @@ Useful options:
 | `--dir <path>` | Exact source destination |
 | `--force` | Replace an existing destination |
 | `--reinstall` | Clean rebuild after updating |
-| `--build-system auto\|make\|cmake\|autotools` | Force a build system |
+| `--build-system auto\|make\|cmake\|autotools\|meson` | Force a build system |
 | `--jobs <n>` | Parallel build jobs |
 | `--configure-args <args>` | Extra arguments for `./configure` (Autotools) |
 | `--make-args <args>` | Extra arguments for `make` |
@@ -98,9 +99,10 @@ illus cast --store --build-system autotools --configure-args "--with-feature"
 ```
 
 `cast` builds the project in the current directory and does **not** install by
-default. It auto-detects Make, CMake, and Autotools (CMake wins when both
-CMake and Autotools files exist). Autotools runs `autoreconf -fi` when
-`configure` is missing, then configures with `--prefix=$HOME/.local`.
+default. It auto-detects Make, CMake, Autotools, and Meson. Autotools runs
+`autoreconf -fi` when `configure` is missing, then configures with
+`--prefix=$HOME/.local`. Meson uses `meson setup/compile/install` with
+`--prefix` and `--destdir`.
 
 `--store` builds and installs into `~/.local`, then writes a manifest under
 `~/.local/share/illus/`. Installation is staged with `DESTDIR`, so only files
@@ -111,18 +113,29 @@ refused by default; pass `--allow-untracked` to install it without a manifest.
 Autotools when a Makefile exists, or runs `make clean` for plain Make projects
 before building.
 
-## Updating
+## Upgrading and updating
+
+```bash
+illus upgrade <package>
+illus upgrade <package> --dry-run
+illus upgrade <package> --reinstall
+```
+
+`upgrade` rebuilds and reinstalls an installed package using the source URL
+(and branch, when recorded) in its manifest. Use `--sha256` when upgrading a
+package originally installed from a tarball. If a package has no recorded
+source, reinstall it with `illus install <url> --name <package>`.
 
 ```bash
 illus update
 illus update --dry-run
 ```
 
-Pulls, rebuilds, and reinstalls every repository under `~/Dreams` that has a
-recognized build system. Repositories without a recognized build system are
-pulled but not built. `update` runs each project's build scripts, so only keep
-repositories you trust in `~/Dreams`. To upgrade one package, run
-`illus install <url>` again (or use `--force`/`--reinstall` as needed).
+`update` pulls, rebuilds, and reinstalls every repository under `~/Dreams`
+that has a recognized build system. It is broader than `upgrade`: it operates
+on `~/Dreams` projects, not individual installed package manifests. `update`
+runs each project's build scripts, so only keep repositories you trust in
+`~/Dreams`.
 
 ## Listing and inspecting packages
 

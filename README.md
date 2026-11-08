@@ -17,9 +17,9 @@ installed file in a manifest for clean removal and verification.
 
 - **URL installs**: `illus install <git-or-tarball-url>` fetches the source,
   builds it, and installs into `~/.local`. Tarball URLs require `--sha256`.
-- **Build system detection**: Auto-detects Make, CMake, and Autotools. CMake
-  wins when both CMake and Autotools files exist; Autotools can bootstrap with
-  `autoreconf` when `configure` is missing.
+- **Build system detection**: Auto-detects Make, CMake, Autotools, and Meson.
+  CMake/Meson take precedence when multiple systems are present as appropriate;
+  Autotools can bootstrap with `autoreconf` when `configure` is missing.
 - **Stateless manifests**: The package name comes from the directory/URL you
   install (or `--name`), and manifests are stored under
   `~/.local/share/illus/`. There is no central database to corrupt.

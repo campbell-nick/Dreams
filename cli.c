@@ -89,6 +89,13 @@ static unsigned long long allowed_mask(cli_command command) {
                OPT_BIT(OPT_JOBS) | OPT_BIT(OPT_BUILD_SYSTEM) |
                OPT_BIT(OPT_CONFIGURE_ARGS) | OPT_BIT(OPT_MAKE_ARGS) |
                OPT_BIT(OPT_SHA256);
+    case CLI_CMD_UPGRADE:
+        return OPT_COMMON | OPT_BIT(OPT_DRY_RUN) | OPT_BIT(OPT_FORCE) |
+               OPT_BIT(OPT_REINSTALL) | OPT_BIT(OPT_BRANCH) |
+               OPT_BIT(OPT_DIR) | OPT_BIT(OPT_ALLOW_UNTRACKED) |
+               OPT_BIT(OPT_JOBS) | OPT_BIT(OPT_BUILD_SYSTEM) |
+               OPT_BIT(OPT_CONFIGURE_ARGS) | OPT_BIT(OPT_MAKE_ARGS) |
+               OPT_BIT(OPT_SHA256);
     case CLI_CMD_REMOVE:
         return OPT_COMMON | OPT_BIT(OPT_DRY_RUN);
     case CLI_CMD_LIST:
@@ -121,6 +128,7 @@ const char *cli_command_name(cli_command command) {
     case CLI_CMD_HELP:    return "help";
     case CLI_CMD_VERSION: return "version";
     case CLI_CMD_INSTALL: return "install";
+    case CLI_CMD_UPGRADE: return "upgrade";
     case CLI_CMD_REMOVE:  return "remove";
     case CLI_CMD_LIST:    return "list";
     case CLI_CMD_INFO:    return "info";
@@ -136,6 +144,7 @@ static cli_command command_from_word(const char *word) {
     if (strcmp(word, "help") == 0) return CLI_CMD_HELP;
     if (strcmp(word, "version") == 0) return CLI_CMD_VERSION;
     if (strcmp(word, "install") == 0) return CLI_CMD_INSTALL;
+    if (strcmp(word, "upgrade") == 0) return CLI_CMD_UPGRADE;
     if (strcmp(word, "remove") == 0) return CLI_CMD_REMOVE;
     if (strcmp(word, "shed") == 0) return CLI_CMD_REMOVE;
     if (strcmp(word, "uninstall") == 0) return CLI_CMD_REMOVE;
@@ -153,6 +162,7 @@ static cli_command command_from_legacy(const char *flag) {
     if (strcmp(flag, "--help") == 0) return CLI_CMD_HELP;
     if (strcmp(flag, "--version") == 0) return CLI_CMD_VERSION;
     if (strcmp(flag, "--install") == 0) return CLI_CMD_INSTALL;
+    if (strcmp(flag, "--upgrade") == 0) return CLI_CMD_UPGRADE;
     if (strcmp(flag, "--remove") == 0) return CLI_CMD_REMOVE;
     if (strcmp(flag, "--shed") == 0) return CLI_CMD_REMOVE;
     if (strcmp(flag, "--uninstall") == 0) return CLI_CMD_REMOVE;
@@ -170,8 +180,13 @@ static void print_usage(const char *program, cli_command command) {
     case CLI_CMD_INSTALL:
         fprintf(stderr, "Usage: %s install <url> [--branch <ref>] [--name <pkg>]\n", program);
         fprintf(stderr, "       [--dir <path>] [--force] [--reinstall] [--dry-run]\n");
-        fprintf(stderr, "       [--build-system auto|make|cmake|autotools] [--sha256 <hex>]\n");
+        fprintf(stderr, "       [--build-system auto|make|cmake|autotools|meson] [--sha256 <hex>]\n");
         fprintf(stderr, "       [--configure-args <args>] [--make-args <args>]\n");
+        break;
+    case CLI_CMD_UPGRADE:
+        fprintf(stderr, "Usage: %s upgrade <package> [--reinstall] [--dry-run]\n", program);
+        fprintf(stderr, "       [--build-system auto|make|cmake|autotools|meson] [--jobs <n>]\n");
+        fprintf(stderr, "       [--configure-args <args>] [--make-args <args>] [--sha256 <hex>]\n");
         break;
     case CLI_CMD_REMOVE:
         fprintf(stderr, "Usage: %s remove <package>... [--dry-run]\n", program);
@@ -190,7 +205,7 @@ static void print_usage(const char *program, cli_command command) {
         fprintf(stderr, "       [--name <pkg>] [--depth <n>] [--recursive] [--force] [--dry-run]\n");
         break;
     case CLI_CMD_CAST:
-        fprintf(stderr, "Usage: %s cast [--store] [--fresh] [--build-system auto|make|cmake|autotools]\n", program);
+        fprintf(stderr, "Usage: %s cast [--store] [--fresh] [--build-system auto|make|cmake|autotools|meson]\n", program);
         fprintf(stderr, "       [--jobs <n>] [--name <pkg>] [--configure-args <args>] [--make-args <args>]\n");
         fprintf(stderr, "       [--allow-untracked]\n");
         break;
@@ -430,6 +445,7 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  %s --<command> [options]    (legacy form)\n\n", program);
         printf("Commands:\n");
         printf("  install <url>        Fetch, build, and install a package from a URL\n");
+        printf("  upgrade <name>       Reinstall an installed package from its recorded source\n");
         printf("  remove <name>...     Uninstall packages (alias: shed)\n");
         printf("  list                 List installed packages\n");
         printf("  info <name>          Show details for an installed package\n");
@@ -459,11 +475,27 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  --dir <path>         Source destination (default ~/Dreams/<pkg>)\n");
         printf("  --force              Replace an existing destination\n");
         printf("  --reinstall          Clean rebuild (--fresh) after updating\n");
-        printf("  --build-system <s>   auto, make, cmake, or autotools\n");
+        printf("  --build-system <s>   auto, make, cmake, autotools, or meson\n");
         printf("  --jobs <n>           Parallel build jobs\n");
         printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
         printf("  --make-args <a>      Extra arguments for make\n");
         printf("  --sha256 <hex>       SHA-256 for a tarball URL install\n");
+        printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
+        printf("  --dry-run            Show what would happen without changing anything\n");
+        break;
+    case CLI_CMD_UPGRADE:
+        printf("Usage: %s upgrade <package> [options]\n\n", program);
+        printf("Rebuild and reinstall an installed package using the source URL recorded\n");
+        printf("in its manifest. If the manifest has no source, install from a URL with\n");
+        printf("`illus install <url> --name <package>`.\n\n");
+        printf("Options:\n");
+        printf("  --reinstall          Clean rebuild (--fresh)\n");
+        printf("  --branch <ref>       Override the recorded branch/tag (git sources)\n");
+        printf("  --build-system <s>   auto, make, cmake, autotools, or meson\n");
+        printf("  --jobs <n>           Parallel build jobs\n");
+        printf("  --configure-args <a> Extra arguments for ./configure/Meson setup\n");
+        printf("  --make-args <a>      Extra arguments for make/Meson compile/install\n");
+        printf("  --sha256 <hex>       SHA-256 for tarball sources\n");
         printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
         printf("  --dry-run            Show what would happen without changing anything\n");
         break;
@@ -514,7 +546,7 @@ void cli_print_help(const char *program, cli_command command) {
         printf("Options:\n");
         printf("  --store              Install into ~/.local and write a manifest\n");
         printf("  --fresh              Clean build artifacts first\n");
-        printf("  --build-system <s>   auto, make, cmake, or autotools\n");
+        printf("  --build-system <s>   auto, make, cmake, autotools, or meson\n");
         printf("  --jobs <n>           Parallel build jobs\n");
         printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
         printf("  --make-args <a>      Extra arguments for make\n");
@@ -598,6 +630,12 @@ int cli_main(int argc, char *argv[]) {
             return 2;
         }
         return cmd_install(&parsed.opts, parsed.args[0]);
+    case CLI_CMD_UPGRADE:
+        if (parsed.nargs != 1) {
+            parse_error(program, parsed.command, "upgrade requires exactly one package name");
+            return 2;
+        }
+        return cmd_upgrade(&parsed.opts, parsed.args[0]);
     case CLI_CMD_CAST:
         if (parsed.nargs != 0) {
             parse_error(program, parsed.command, "cast does not take positional arguments");

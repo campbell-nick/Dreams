@@ -4,6 +4,12 @@ This project aims to follow [Semantic Versioning](https://semver.org/) for tagge
 
 ## Unreleased / 1.3.0(dev)
 
+### Added
+- **`upgrade <package>`**: reinstalls an installed package using the source URL (and branch, when recorded) from its manifest. Supports `--dry-run`, `--reinstall`, build options, and `--sha256` for tarball sources.
+- **Meson/Ninja build support**: auto-detects `meson.build` (`--build-system=meson`), runs `meson setup/compile/install` with `--prefix` and `DESTDIR` staging.
+- Improved failure diagnostics: failed commands report exit status and command context; `--verbose` echoes commands.
+- `doctor` checks for download and SHA-256 tools, plus `meson`/`ninja`.
+
 ### Changed
 - **URL-first installs**: `illus install` now takes a git or tarball URL/path. Tarball URLs require `--sha256`.
 - `info` reports installed manifest details only.
@@ -15,7 +21,7 @@ This project aims to follow [Semantic Versioning](https://semver.org/) for tagge
 - Bundled `registry/` data.
 
 ### Kept
-- Make/CMake/Autotools detection (including Autotools bootstrap with `autoreconf` when needed).
+- Make/CMake/Autotools/Meson detection (including Autotools bootstrap with `autoreconf` when needed).
 - `DESTDIR` staging, stateless manifests under `~/.local/share/illus/`, `list`, `remove`/`shed`, `update`, `pull`, `cast`, `doctor`, `--dry-run`, and safety checks.
 
 ### Compatibility

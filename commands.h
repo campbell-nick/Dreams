@@ -35,6 +35,7 @@ typedef struct {
 int cmd_pull(const illus_options *opts, const char *url);
 int cmd_cast(const illus_options *opts);
 int cmd_install(const illus_options *opts, const char *spec);
+int cmd_upgrade(const illus_options *opts, const char *package_name);
 int cmd_update(const illus_options *opts);
 int cmd_version(void);
 int cmd_shed(const illus_options *opts, const char *package_name);

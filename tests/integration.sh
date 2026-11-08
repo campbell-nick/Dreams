@@ -514,6 +514,35 @@ PATH=$OLDPATH
 [ -x "$BINDIR/boot-hello" ] || fail "bootstrapped Autotools binary not installed"
 run "$BIN" remove bootstrap-pkg
 
+if command -v meson >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
+    echo "== Meson project =="
+    MSRC="$TMP/src/meson-pkg"
+    mkdir -p "$MSRC"
+    cat > "$MSRC/main.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+    cat > "$MSRC/meson.build" <<'EOF'
+project('meson-pkg', 'c')
+executable('hello-meson', 'main.c', install : true)
+EOF
+    run_in "$MSRC" "$BIN" cast --store
+    [ -x "$BINDIR/hello-meson" ] || fail "Meson binary not installed"
+    grep -q "^bin/hello-meson$" "$MDIR/meson-pkg.txt" ||
+        fail "Meson manifest path wrong"
+    run "$BIN" remove meson-pkg
+fi
+
+echo "== upgrade command =="
+run "$BIN" install "$HELLO" --name hello
+run "$BIN" upgrade hello --dry-run
+grep -q "would upgrade 'hello'" "$TMP/last.log" || fail "upgrade dry-run"
+grep -q "$HELLO" "$TMP/last.log" || fail "upgrade dry-run source"
+printf '#!/bin/sh\necho version-upgraded\n' > "$HELLO/hello"
+commit_all "$HELLO" "version upgraded"
+run "$BIN" upgrade hello
+grep -q "version-upgraded" "$BINDIR/hello" || fail "upgrade did not rebuild"
+run "$BIN" remove hello
+
 echo "== stale state and manifest cleanup =="
 if has_entry "$MDIR" '.manifest-*'; then
     fail "temporary manifest files were left behind"

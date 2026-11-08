@@ -10,6 +10,7 @@ typedef enum {
     CLI_CMD_HELP,
     CLI_CMD_VERSION,
     CLI_CMD_INSTALL,
+    CLI_CMD_UPGRADE,
     CLI_CMD_REMOVE,
     CLI_CMD_LIST,
     CLI_CMD_INFO,

@@ -30,10 +30,36 @@
 /* Small helpers                                                             */
 /* ------------------------------------------------------------------------- */
 
+static int g_verbose = 0;
+
+static void print_command(char *const argv[]) {
+    int i;
+
+    if (!g_verbose || !argv || !argv[0]) return;
+    fprintf(stderr, "[Dreams] +");
+    for (i = 0; argv[i] != NULL && i < 8; i++) {
+        fprintf(stderr, " %s", argv[i]);
+    }
+    if (argv[i] != NULL) fprintf(stderr, " ...");
+    fprintf(stderr, "\n");
+}
+
+static void print_command_failure(char *const argv[], int status) {
+    int i;
+
+    fprintf(stderr, "[Dreams] Command failed (exit %d):", status);
+    for (i = 0; argv && argv[i] != NULL && i < 6; i++) {
+        fprintf(stderr, " %s", argv[i]);
+    }
+    if (argv && argv[i] != NULL) fprintf(stderr, " ...");
+    fprintf(stderr, "\n");
+}
+
 static int run_cmd(char *const argv[]) {
     pid_t pid;
     int status;
 
+    print_command(argv);
     fflush(NULL);
     pid = fork();
     if (pid < 0) {
@@ -50,8 +76,12 @@ static int run_cmd(char *const argv[]) {
         return -1;
     }
     if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
+        int code = WEXITSTATUS(status);
+        if (code != 0) print_command_failure(argv, code);
+        return code;
     }
+    fprintf(stderr, "[Dreams] Command terminated abnormally: %s\n",
+            argv && argv[0] ? argv[0] : "?");
     return -1;
 }
 
@@ -1336,6 +1366,8 @@ static int make_stage_dir(const char *home, char *out, size_t out_size) {
 }
 
 /* Find a manifest that owns the given binary name. */
+static void manifest_package_name(const char *manifest, char *out, size_t out_size);
+
 static int find_manifest_for_binary(const char *manifest_dir, const char *binary,
                                     char *out, size_t out_size) {
     DIR *d = opendir(manifest_dir);
@@ -1978,6 +2010,7 @@ int cmd_cast(const illus_options *opts) {
     char configure_in_path[PATH_MAX];
     char makefile_am_path[PATH_MAX];
     char makefile_in_path[PATH_MAX];
+    char meson_path[PATH_MAX];
     char build_dir[PATH_MAX];
     char pkg_name[256];
     char jobs_buf[32];
@@ -1988,9 +2021,11 @@ int cmd_cast(const illus_options *opts) {
     int is_makefile;
     int is_autotools;
     int has_configure;
+    int is_meson;
     int rc = 0;
     manifest_meta meta;
 
+    if (opts && opts->verbose) g_verbose = 1;
     if (refuse_root(opts->store ? "cast --store" : "cast")) return 1;
 
     home = get_real_home(&uid, &gid);
@@ -2019,6 +2054,8 @@ int cmd_cast(const illus_options *opts) {
                   "Makefile.am") != 0 ||
         path_join(makefile_in_path, sizeof makefile_in_path, workspace,
                   "Makefile.in") != 0 ||
+        path_join(meson_path, sizeof meson_path, workspace,
+                  "meson.build") != 0 ||
         path_join(build_dir, sizeof build_dir, workspace, "build") != 0) {
         fprintf(stderr, "[Dreams] Error: path is too long.\n");
         free(home);
@@ -2027,6 +2064,7 @@ int cmd_cast(const illus_options *opts) {
 
     is_cmake = (access(cmake_path, F_OK) == 0);
     is_makefile = (access(makefile_path, F_OK) == 0);
+    is_meson = (access(meson_path, F_OK) == 0);
     has_configure = (access(configure_path, F_OK) == 0);
     is_autotools = has_configure ||
         ((access(configure_ac_path, F_OK) == 0 ||
@@ -2039,15 +2077,27 @@ int cmd_cast(const illus_options *opts) {
         if (strcmp(opts->build_system, "cmake") == 0) {
             is_makefile = 0;
             is_autotools = 0;
+            is_meson = 0;
             if (!is_cmake) {
                 fprintf(stderr,
                         "[Dreams] Error: --build-system=cmake but no CMakeLists.txt found.\n");
                 free(home);
                 return 1;
             }
+        } else if (strcmp(opts->build_system, "meson") == 0) {
+            is_cmake = 0;
+            is_makefile = 0;
+            is_autotools = 0;
+            if (!is_meson) {
+                fprintf(stderr,
+                        "[Dreams] Error: --build-system=meson but no meson.build found.\n");
+                free(home);
+                return 1;
+            }
         } else if (strcmp(opts->build_system, "autotools") == 0) {
             is_cmake = 0;
             is_makefile = 0;
+            is_meson = 0;
             if (!is_autotools) {
                 fprintf(stderr,
                         "[Dreams] Error: --build-system=autotools but no configure or "
@@ -2058,6 +2108,7 @@ int cmd_cast(const illus_options *opts) {
         } else if (strcmp(opts->build_system, "make") == 0) {
             is_cmake = 0;
             is_autotools = 0;
+            is_meson = 0;
             if (!is_makefile) {
                 fprintf(stderr,
                         "[Dreams] Error: --build-system=make but no Makefile found.\n");
@@ -2067,18 +2118,22 @@ int cmd_cast(const illus_options *opts) {
         } else {
             fprintf(stderr,
                     "[Dreams] Error: --build-system must be 'auto', 'make', 'cmake', "
-                    "or 'autotools'.\n");
+                    "'autotools', or 'meson'.\n");
             free(home);
             return 1;
         }
     } else if (is_cmake) {
-        /* CMake wins when a project ships both CMake and Autotools files. */
+        is_meson = 0;
         is_autotools = 0;
+        is_makefile = 0;
+    } else if (is_meson) {
+        is_autotools = 0;
+        is_makefile = 0;
     } else if (is_autotools) {
         is_makefile = 0;
     }
 
-    if (!is_cmake && !is_autotools && !is_makefile) {
+    if (!is_cmake && !is_meson && !is_autotools && !is_makefile) {
         fprintf(stderr,
                 "[Dreams] Error: No recognized build system found in current directory.\n");
         free(home);
@@ -2226,6 +2281,111 @@ int cmd_cast(const illus_options *opts) {
                 remove_directory(stage);
                 free(home);
                 return 1;
+            }
+            if (can_track) {
+                if (track_install(home, pkg_name, stage, uid, gid, &meta,
+                                  opts->allow_untracked) != 0) {
+                    rc = -1;
+                }
+            } else {
+                fprintf(stderr,
+                        "[Dreams] Warning: installing without a manifest (--allow-untracked).\n");
+                if (track_install(home, NULL, stage, uid, gid, NULL, 1) != 0) {
+                    rc = -1;
+                }
+            }
+            remove_directory(stage);
+            if (rc != 0) {
+                free(home);
+                return 1;
+            }
+        }
+    } else if (is_meson) {
+        char prefix_arg[PATH_MAX];
+        char build_marker[PATH_MAX];
+        const char *opt = "--prefix=";
+        size_t opt_len = strlen(opt);
+        size_t dir_len = strlen(local_dir);
+        int reconfigure = 0;
+        struct stat bst;
+
+        printf("[Dreams] Detected Meson build system.\n");
+        if (!tool_available("meson")) {
+            fprintf(stderr, "[Dreams] Error: meson is not installed.\n");
+            free(home);
+            return 1;
+        }
+        if (opt_len + dir_len + 1 > sizeof prefix_arg) {
+            fprintf(stderr, "[Dreams] Error: install prefix is too long.\n");
+            free(home);
+            return 1;
+        }
+        memcpy(prefix_arg, opt, opt_len);
+        memcpy(prefix_arg + opt_len, local_dir, dir_len + 1);
+
+        if (!opts->fresh &&
+            path_join(build_marker, sizeof build_marker, build_dir,
+                      "meson-private") == 0 &&
+            stat(build_marker, &bst) == 0) {
+            reconfigure = 1;
+        }
+        if (reconfigure) {
+            char *const setup_argv[] = {
+                "meson", "setup", "--reconfigure", build_dir, workspace,
+                prefix_arg, NULL
+            };
+            if (run_cmd_extra(setup_argv, opts->configure_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: Meson configuration failed.\n");
+                free(home);
+                return 1;
+            }
+        } else {
+            char *const setup_argv[] = {
+                "meson", "setup", build_dir, workspace, prefix_arg, NULL
+            };
+            if (run_cmd_extra(setup_argv, opts->configure_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: Meson configuration failed.\n");
+                free(home);
+                return 1;
+            }
+        }
+
+        if (opts->jobs > 0) {
+            char *const build_argv[] = {
+                "meson", "compile", "-C", build_dir, "-j", jobs_buf, NULL
+            };
+            if (run_cmd_extra(build_argv, opts->make_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        } else {
+            char *const build_argv[] = {"meson", "compile", "-C", build_dir, NULL};
+            if (run_cmd_extra(build_argv, opts->make_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        }
+
+        if (opts->store) {
+            if (make_stage_dir(home, stage, sizeof stage) != 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: could not create staging directory.\n");
+                free(home);
+                return 1;
+            }
+            {
+                char *const install_argv[] = {
+                    "meson", "install", "-C", build_dir, "--destdir", stage, NULL
+                };
+                printf("[Dreams] Storing package into %s (--store)...\n", local_dir);
+                if (run_cmd_extra(install_argv, opts->make_args) != 0) {
+                    fprintf(stderr, "[Dreams] Error: installation failed.\n");
+                    remove_directory(stage);
+                    free(home);
+                    return 1;
+                }
             }
             if (can_track) {
                 if (track_install(home, pkg_name, stage, uid, gid, &meta,
@@ -2465,6 +2625,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
     int is_tarball;
     int rc;
 
+    if (opts && opts->verbose) g_verbose = 1;
     if (refuse_root("install")) return 1;
     if (!spec || !*spec) {
         fprintf(stderr, "[Dreams] Error: install requires a repository or tarball URL.\n");
@@ -2711,6 +2872,136 @@ int cmd_install(const illus_options *opts, const char *spec) {
     return rc;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Upgrade command                                                           */
+/* ------------------------------------------------------------------------- */
+
+int cmd_upgrade(const illus_options *opts, const char *package_name) {
+    char *home;
+    char local_dir[PATH_MAX];
+    char manifest_dir[PATH_MAX];
+    char direct[PATH_MAX];
+    char manifest[PATH_MAX] = "";
+    char pkg_name[256];
+    strlist files;
+    manifest_meta meta;
+    size_t unsafe = 0;
+    int found = 0;
+    int via_binary = 0;
+    illus_options iopts;
+
+    if (opts && opts->verbose) g_verbose = 1;
+    if (refuse_root("upgrade")) return 1;
+    if (!is_valid_name(package_name)) {
+        fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n",
+                package_name);
+        return 1;
+    }
+
+    home = get_real_home(NULL, NULL);
+    if (!home) {
+        fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
+        return 1;
+    }
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0 ||
+        path_join(manifest_dir, sizeof manifest_dir, home,
+                  ".local/share/illus") != 0) {
+        fprintf(stderr, "[Dreams] Error: path is too long.\n");
+        free(home);
+        return 1;
+    }
+    free(home);
+
+    {
+        char filename[PATH_MAX];
+        if (make_filename(filename, sizeof filename, package_name, ".txt") == 0 &&
+            path_join(direct, sizeof direct, manifest_dir, filename) == 0 &&
+            access(direct, R_OK) == 0) {
+            copy_field(manifest, sizeof manifest, direct);
+            found = 1;
+        }
+    }
+    if (!found) {
+        int matches = find_manifest_for_binary(manifest_dir, package_name,
+                                               manifest, sizeof manifest);
+        if (matches == -2) {
+            fprintf(stderr,
+                    "[Dreams] Error: multiple packages provide '%s'; use the package name.\n",
+                    package_name);
+            return 1;
+        }
+        if (matches == 1) {
+            found = 1;
+            via_binary = 1;
+        }
+    }
+    if (!found) {
+        fprintf(stderr,
+                "[Dreams] Error: package '%s' is not installed (no manifest found).\n",
+                package_name);
+        fprintf(stderr,
+                "[Dreams] Install it with: illus install <url> --name %s\n",
+                package_name);
+        return 1;
+    }
+
+    if (via_binary) {
+        manifest_package_name(manifest, pkg_name, sizeof pkg_name);
+    } else {
+        copy_field(pkg_name, sizeof pkg_name, package_name);
+    }
+
+    memset(&files, 0, sizeof files);
+    manifest_meta_clear(&meta);
+    if (manifest_read(&files, &meta, &unsafe, manifest, local_dir, NULL) != 0) {
+        perror("[Dreams] Error: could not read manifest");
+        strlist_free(&files);
+        return 1;
+    }
+    strlist_free(&files);
+
+    if (!meta.source[0]) {
+        fprintf(stderr,
+                "[Dreams] Error: package '%s' has no recorded source URL.\n",
+                pkg_name);
+        fprintf(stderr,
+                "[Dreams] Reinstall with: illus install <url> --name %s\n",
+                pkg_name);
+        return 1;
+    }
+
+    if (url_is_tarball(meta.source) && (!opts->sha256 || !*opts->sha256)) {
+        fprintf(stderr,
+                "[Dreams] Error: package '%s' was installed from a tarball; --sha256 is required to upgrade it.\n",
+                pkg_name);
+        fprintf(stderr,
+                "[Dreams] Reinstall with: illus install <tarball-url> --name %s --sha256 <hex>\n",
+                pkg_name);
+        return 1;
+    }
+
+    if (opts->dry_run) {
+        printf("[Dreams] Dry run: would upgrade '%s' from %s", pkg_name,
+               meta.source);
+        if (opts->branch && *opts->branch) {
+            printf(" (branch %s)", opts->branch);
+        } else if (meta.branch[0]) {
+            printf(" (branch %s)", meta.branch);
+        }
+        printf("\n");
+    } else {
+        printf("[Dreams] Upgrading '%s' from %s...\n", pkg_name, meta.source);
+    }
+
+    iopts = *opts;
+    iopts.name = pkg_name;
+    if (!(iopts.branch && *iopts.branch) && meta.branch[0]) {
+        iopts.branch = meta.branch;
+    }
+    iopts.dir = opts->dir;
+    return cmd_install(&iopts, meta.source);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Update command                                                            */
@@ -3739,6 +4030,19 @@ int cmd_doctor(const illus_options *opts) {
         } else {
             doctor_emit(&state, "warn", "SHA-256 tool available",
                         "sha256sum, shasum, or openssl needed for tarball verification");
+        }
+
+        if (find_in_path("meson", path, sizeof path) == 0) {
+            doctor_emit(&state, "pass", "meson available", path);
+        } else {
+            doctor_emit(&state, "warn", "meson available",
+                        "needed for Meson projects");
+        }
+        if (find_in_path("ninja", path, sizeof path) == 0) {
+            doctor_emit(&state, "pass", "ninja available", path);
+        } else {
+            doctor_emit(&state, "warn", "ninja available",
+                        "often used by Meson/CMake builds");
         }
     }
 
