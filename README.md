@@ -32,7 +32,9 @@ installed file in a manifest for clean removal and verification.
 - **Hardened fetches**: Git clones and tarball downloads/extractions are staged
   in a temporary sibling and swapped into place only after success. Tarballs
   require a SHA-256 checksum. Existing destinations need `--force`, and system
-  paths and symlink escapes are refused.
+  paths and symlink escapes are refused. For HTTPS clones, `illus` prefers
+  [`cgc`](https://github.com/campbell-nick/CGC) when it is available on
+  `PATH` (falling back to `git clone` otherwise).
 - **Dry runs and diagnostics**: `--dry-run` shows what a mutating command would
   do, and `illus doctor` checks paths, permissions, tools, manifests, and stale
   state.
