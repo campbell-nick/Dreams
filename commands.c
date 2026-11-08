@@ -7,20 +7,28 @@
 #define _DARWIN_C_SOURCE
 #endif
 #define _XOPEN_SOURCE 700
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <pwd.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <pwd.h>
-#include <limits.h>
-#include <errno.h>
+
 #include "commands.h"
 
-#define ILLUS_VERSION "1.0.0"
+#define MANIFEST_HEADER      "# illus-manifest-v2"
+#define REGISTRY_FILE        "packages.tsv"
+#define REGISTRY_SUBDIR      "registry"
+#define DEFAULT_REGISTRY_URL "https://github.com/campbell-nick/Dreams.git"
+#define REGISTRY_MAX_AGE     86400
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                             */
@@ -342,6 +350,7 @@ static int check_existing_ancestor(const char *path, const char *home) {
         *slash = '\0';
     }
 }
+
 /* ------------------------------------------------------------------------- */
 /* Filesystem helpers                                                        */
 /* ------------------------------------------------------------------------- */
@@ -367,6 +376,18 @@ static void remove_directory(const char *path) {
     }
     closedir(d);
     if (rmdir(path) != 0) {
+        /* best effort */
+    }
+}
+
+/* Remove a path whether it is a file, symlink, or directory. */
+static void remove_path(const char *path) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+        remove_directory(path);
+    } else if (unlink(path) != 0) {
         /* best effort */
     }
 }
@@ -420,7 +441,220 @@ static void chown_with_parents(const char *path, const char *stop, uid_t uid, gi
     }
 }
 
-/* A tiny string list used to collect installed files. */
+/* ------------------------------------------------------------------------- */
+/* Output, root, and lookup helpers                                          */
+/* ------------------------------------------------------------------------- */
+
+static int use_color(void) {
+    const char *no = getenv("NO_COLOR");
+
+    if (no && *no) return 0;
+    return isatty(STDOUT_FILENO) ? 1 : 0;
+}
+
+static int env_truthy(const char *name) {
+    const char *value = getenv(name);
+
+    if (!value || !*value) return 0;
+    if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "no") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int refuse_root(const char *what) {
+    if (geteuid() != 0) return 0;
+    if (env_truthy("ILLUS_ALLOW_ROOT")) {
+        fprintf(stderr,
+                "[Dreams] Warning: running %s as root (ILLUS_ALLOW_ROOT is set).\n",
+                what);
+        return 0;
+    }
+    fprintf(stderr, "[Dreams] Error: refusing to run %s as root.\n", what);
+    fprintf(stderr,
+            "[Dreams] Run illus as your normal user. Set ILLUS_ALLOW_ROOT=1 only "
+            "in a trusted container.\n");
+    return 1;
+}
+
+static int find_in_path(const char *name, char *out, size_t out_size) {
+    const char *path = getenv("PATH");
+
+    if (!path || !*path) return -1;
+    for (;;) {
+        const char *colon = strchr(path, ':');
+        size_t len = colon ? (size_t)(colon - path) : strlen(path);
+        char dir[PATH_MAX];
+        char candidate[PATH_MAX];
+
+        if (len == 0) {
+            dir[0] = '.';
+            dir[1] = '\0';
+        } else if (len >= sizeof dir) {
+            if (!colon) break;
+            path = colon + 1;
+            continue;
+        } else {
+            memcpy(dir, path, len);
+            dir[len] = '\0';
+        }
+        if (path_join(candidate, sizeof candidate, dir, name) == 0 &&
+            access(candidate, X_OK) == 0) {
+            if (strlen(candidate) + 1 > out_size) return -1;
+            strcpy(out, candidate);
+            return 0;
+        }
+        if (!colon) break;
+        path = colon + 1;
+    }
+    return -1;
+}
+
+static int dir_on_path(const char *dir) {
+    const char *path = getenv("PATH");
+    char resolved_dir[PATH_MAX];
+    const char *want = dir;
+
+    if (!path || !*path) return 0;
+    if (realpath(dir, resolved_dir)) want = resolved_dir;
+    for (;;) {
+        const char *colon = strchr(path, ':');
+        size_t len = colon ? (size_t)(colon - path) : strlen(path);
+        char entry[PATH_MAX];
+        char resolved[PATH_MAX];
+        const char *cmp = entry;
+
+        if (len == 0) {
+            entry[0] = '.';
+            entry[1] = '\0';
+        } else if (len >= sizeof entry) {
+            if (!colon) break;
+            path = colon + 1;
+            continue;
+        } else {
+            memcpy(entry, path, len);
+            entry[len] = '\0';
+        }
+        if (realpath(entry, resolved)) cmp = resolved;
+        if (strcmp(cmp, want) == 0) return 1;
+        if (!colon) break;
+        path = colon + 1;
+    }
+    return 0;
+}
+
+static void format_size(unsigned long long bytes, char *out, size_t size) {
+    static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = (double)bytes;
+    int unit = 0;
+
+    while (value >= 1024.0 && unit < 4) {
+        value /= 1024.0;
+        unit++;
+    }
+    if (unit == 0) {
+        snprintf(out, size, "%llu B", bytes);
+    } else {
+        snprintf(out, size, "%.1f %s", value, units[unit]);
+    }
+}
+
+static void json_string(FILE *f, const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+
+    fputc('"', f);
+    for (; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f); break;
+        case '\f': fputs("\\f", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20) {
+                fprintf(f, "\\u%04x", *p);
+            } else {
+                fputc(*p, f);
+            }
+            break;
+        }
+    }
+    fputc('"', f);
+}
+
+static int looks_like_url(const char *s) {
+    size_t len;
+
+    if (!s || !*s) return 0;
+    if (strstr(s, "://") != NULL) return 1;
+    if (strncmp(s, "git@", 4) == 0) return 1;
+    len = strlen(s);
+    if (len > 4 && strcmp(s + len - 4, ".git") == 0) return 1;
+    return 0;
+}
+
+static int validate_repo_url(const char *url) {
+    size_t i;
+
+    if (!url || !*url) return -1;
+    if (url[0] == '-') return -1;
+    for (i = 0; url[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)url[i];
+        if (c < 0x20 || c == 0x7f || isspace(c)) return -1;
+    }
+    return 0;
+}
+
+static int derive_repo_name(const char *url, char *out, size_t out_size) {
+    size_t url_len;
+    const char *name_end;
+    const char *name_start;
+    size_t name_len;
+
+    if (!url || !*url) return -1;
+    url_len = strlen(url);
+    while (url_len > 0 && url[url_len - 1] == '/') url_len--;
+    name_end = url + url_len;
+    name_start = name_end;
+    while (name_start > url && name_start[-1] != '/' && name_start[-1] != ':') {
+        name_start--;
+    }
+    name_len = (size_t)(name_end - name_start);
+    if (name_len == 0 || name_len >= out_size) return -1;
+    memcpy(out, name_start, name_len);
+    out[name_len] = '\0';
+    if (name_len > 4 && strcmp(out + name_len - 4, ".git") == 0) {
+        out[name_len - 4] = '\0';
+    }
+    return is_valid_name(out) ? 0 : -1;
+}
+
+static int contains_ci(const char *haystack, const char *needle) {
+    size_t needle_len = strlen(needle);
+    const char *p;
+
+    if (needle_len == 0) return 1;
+    for (p = haystack; *p; p++) {
+        size_t i;
+        for (i = 0; i < needle_len; i++) {
+            if (!p[i]) return 0;
+            if (tolower((unsigned char)p[i]) !=
+                tolower((unsigned char)needle[i])) {
+                break;
+            }
+        }
+        if (i == needle_len) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* String lists                                                              */
+/* ------------------------------------------------------------------------- */
+
 typedef struct {
     char **items;
     size_t len;
@@ -459,23 +693,198 @@ static void strlist_free(strlist *l) {
     l->cap = 0;
 }
 
-/* Re-read an existing manifest so upgrades keep ownership of old files. */
-static void load_manifest(strlist *files, const char *manifest,
-                          const char *local_dir, const char *skip_dir) {
-    FILE *f = fopen(manifest, "r");
-    char line[PATH_MAX];
+/* ------------------------------------------------------------------------- */
+/* Manifest handling                                                         */
+/* ------------------------------------------------------------------------- */
 
-    if (!f) return;
+typedef struct {
+    char package[256];
+    char source[PATH_MAX];
+    char branch[256];
+    char installed[64];
+    int version;
+} manifest_meta;
+
+static void copy_field(char *dst, size_t size, const char *src) {
+    size_t len = strlen(src);
+
+    if (len >= size) len = size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static void manifest_meta_clear(manifest_meta *meta) {
+    memset(meta, 0, sizeof *meta);
+}
+
+static void manifest_parse_header(manifest_meta *meta, const char *line) {
+    if (strcmp(line, MANIFEST_HEADER) == 0) {
+        meta->version = 2;
+    } else if (strncmp(line, "# package: ", 11) == 0) {
+        copy_field(meta->package, sizeof meta->package, line + 11);
+    } else if (strncmp(line, "# source: ", 10) == 0) {
+        copy_field(meta->source, sizeof meta->source, line + 10);
+    } else if (strncmp(line, "# branch: ", 10) == 0) {
+        copy_field(meta->branch, sizeof meta->branch, line + 10);
+    } else if (strncmp(line, "# installed: ", 13) == 0) {
+        copy_field(meta->installed, sizeof meta->installed, line + 13);
+    }
+}
+
+/* Resolve a manifest entry to an absolute path. */
+static int manifest_resolve_entry(const char *line, const char *local_dir,
+                                  char *out, size_t out_size) {
+    if (!line || !*line) return -1;
+    if (line[0] == '/') {
+        if (strlen(line) + 1 > out_size) return -1;
+        strcpy(out, line);
+        return 0;
+    }
+    if (has_dotdot(line)) return -1;
+    return path_join(out, out_size, local_dir, line);
+}
+
+/*
+ * Read a manifest. Absolute paths are accepted for backward compatibility;
+ * relative paths are resolved against local_dir. Entries outside local_dir
+ * are counted in *unsafe and skipped. Returns 0 on success, -1 if the file
+ * could not be opened.
+ */
+static int manifest_read(strlist *files, manifest_meta *meta, size_t *unsafe,
+                         const char *manifest, const char *local_dir,
+                         const char *skip_dir) {
+    FILE *f;
+    char line[PATH_MAX];
+    size_t bad = 0;
+
+    if (meta) manifest_meta_clear(meta);
+    if (unsafe) *unsafe = 0;
+    f = fopen(manifest, "r");
+    if (!f) return -1;
     while (fgets(line, sizeof line, f)) {
-        struct stat st;
+        char resolved[PATH_MAX];
+
         line[strcspn(line, "\r\n")] = '\0';
         if (!line[0]) continue;
-        if (!is_within(line, local_dir)) continue;
-        if (skip_dir && is_within(line, skip_dir)) continue;
-        if (lstat(line, &st) != 0) continue;
-        if (strlist_add(files, line) != 0) break;
+        if (line[0] == '#') {
+            if (meta) manifest_parse_header(meta, line);
+            continue;
+        }
+        if (manifest_resolve_entry(line, local_dir, resolved,
+                                   sizeof resolved) != 0) {
+            bad++;
+            continue;
+        }
+        if (!is_within(resolved, local_dir)) {
+            bad++;
+            continue;
+        }
+        if (skip_dir && is_within(resolved, skip_dir)) continue;
+        if (strlist_add(files, resolved) != 0) break;
     }
     fclose(f);
+    if (unsafe) *unsafe = bad;
+    return 0;
+}
+
+/* Drop entries whose files no longer exist (used when upgrading). */
+static void manifest_filter_existing(strlist *files) {
+    size_t i;
+    size_t out = 0;
+
+    for (i = 0; i < files->len; i++) {
+        struct stat st;
+        if (lstat(files->items[i], &st) == 0) {
+            files->items[out++] = files->items[i];
+        } else {
+            free(files->items[i]);
+        }
+    }
+    files->len = out;
+}
+
+/* Convert an absolute path under root to a relative manifest entry. */
+static int path_relative(const char *path, const char *root,
+                         char *out, size_t out_size) {
+    size_t root_len = strlen(root);
+    const char *rel;
+
+    if (!is_within(path, root)) return -1;
+    rel = path + root_len;
+    if (*rel == '/') rel++;
+    if (!*rel) return -1;
+    if (strlen(rel) + 1 > out_size) return -1;
+    strcpy(out, rel);
+    return 0;
+}
+
+/*
+ * Write a manifest atomically: create a temporary file in the same directory,
+ * fsync it, then rename it over the old manifest. Relative paths are stored
+ * whenever the file lives under local_dir.
+ */
+static int manifest_write_atomic(const char *manifest_file, const char *local_dir,
+                                 const manifest_meta *meta,
+                                 const strlist *files) {
+    char dir[PATH_MAX];
+    char tmpl[PATH_MAX];
+    int fd;
+    FILE *f;
+    size_t i;
+    int failed = 0;
+
+    if (parent_dir(manifest_file, dir, sizeof dir) != 0) return -1;
+    if (path_join(tmpl, sizeof tmpl, dir, ".manifest-XXXXXX") != 0) return -1;
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        perror("[Dreams] Error: could not create temporary manifest");
+        return -1;
+    }
+    f = fdopen(fd, "w");
+    if (!f) {
+        perror("[Dreams] Error: could not open temporary manifest");
+        close(fd);
+        unlink(tmpl);
+        return -1;
+    }
+
+    if (fprintf(f, "%s\n", MANIFEST_HEADER) < 0) failed = 1;
+    if (meta) {
+        if (meta->package[0] &&
+            fprintf(f, "# package: %s\n", meta->package) < 0) failed = 1;
+        if (meta->source[0] &&
+            fprintf(f, "# source: %s\n", meta->source) < 0) failed = 1;
+        if (meta->branch[0] &&
+            fprintf(f, "# branch: %s\n", meta->branch) < 0) failed = 1;
+        if (meta->installed[0] &&
+            fprintf(f, "# installed: %s\n", meta->installed) < 0) failed = 1;
+    }
+    for (i = 0; i < files->len; i++) {
+        char rel[PATH_MAX];
+        const char *entry = files->items[i];
+
+        if (path_relative(entry, local_dir, rel, sizeof rel) == 0) entry = rel;
+        if (fprintf(f, "%s\n", entry) < 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (fflush(f) != 0) failed = 1;
+    if (fsync(fileno(f)) != 0) failed = 1;
+    if (fclose(f) != 0) failed = 1;
+    if (failed) {
+        unlink(tmpl);
+        return -1;
+    }
+    if (chmod(tmpl, 0644) != 0) {
+        /* best effort */
+    }
+    if (rename(tmpl, manifest_file) != 0) {
+        perror("[Dreams] Error: could not replace manifest");
+        unlink(tmpl);
+        return -1;
+    }
+    return 0;
 }
 
 /* Move a staged install tree into place, recording every final file path. */
@@ -487,7 +896,7 @@ static int move_tree(const char *src_root, const char *dst_root, strlist *files,
 
     d = opendir(src_root);
     if (!d) {
-        perror("[Dreams] Warning: could not read staged install");
+        perror("[Dreams] Error: could not read staged install");
         return -1;
     }
     while ((p = readdir(d)) != NULL) {
@@ -506,16 +915,14 @@ static int move_tree(const char *src_root, const char *dst_root, strlist *files,
 
         if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
             if (dst_exists && !(S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode))) {
-                if (S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode)) {
-                    remove_directory(dst);
-                } else if (unlink(dst) != 0) {
-                    perror("[Dreams] Warning: could not replace destination");
+                if (unlink(dst) != 0) {
+                    perror("[Dreams] Error: could not replace destination");
                     rc = -1;
                     continue;
                 }
             }
             if (mkdir_p(dst, st.st_mode & 0777) != 0) {
-                perror("[Dreams] Warning: could not create installation directory");
+                perror("[Dreams] Error: could not create installation directory");
                 rc = -1;
                 continue;
             }
@@ -533,18 +940,18 @@ static int move_tree(const char *src_root, const char *dst_root, strlist *files,
             if (dst_exists) {
                 if (S_ISDIR(dst_st.st_mode) && !S_ISLNK(dst_st.st_mode)) {
                     fprintf(stderr,
-                            "[Dreams] Warning: refusing to replace directory with file: %s\n",
+                            "[Dreams] Error: refusing to replace directory with file: %s\n",
                             dst);
                     rc = -1;
                     continue;
                 } else if (unlink(dst) != 0) {
-                    perror("[Dreams] Warning: could not replace destination");
+                    perror("[Dreams] Error: could not replace destination");
                     rc = -1;
                     continue;
                 }
             }
             if (rename(src, dst) != 0) {
-                perror("[Dreams] Warning: could not install file");
+                perror("[Dreams] Error: could not install file");
                 rc = -1;
                 continue;
             }
@@ -603,6 +1010,7 @@ static int find_manifest_for_binary(const char *manifest_dir, const char *binary
         while (fgets(line, sizeof line, f)) {
             const char *base;
             line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0] || line[0] == '#') continue;
             base = strrchr(line, '/');
             base = base ? base + 1 : line;
             if (strcmp(base, binary) == 0) {
@@ -658,9 +1066,13 @@ static void remove_empty_parents(const char *path, const char *stop) {
     }
 }
 
-/* Move a DESTDIR stage into ~/.local and write the package manifest. */
-static void track_install(const char *home, const char *pkg_name, const char *stage,
-                          uid_t uid, gid_t gid) {
+/*
+ * Move a DESTDIR stage into ~/.local and write the package manifest.
+ * Returns 0 only when every file moved and the manifest was written.
+ */
+static int track_install(const char *home, const char *pkg_name, const char *stage,
+                         uid_t uid, gid_t gid, const manifest_meta *meta,
+                         int allow_untracked) {
     char local_dir[PATH_MAX];
     char staged_local[PATH_MAX];
     char manifest_dir[PATH_MAX];
@@ -668,104 +1080,717 @@ static void track_install(const char *home, const char *pkg_name, const char *st
     char manifest_file[PATH_MAX];
     struct stat st;
     strlist files;
-    FILE *mf;
-    size_t i;
+    int move_rc;
+    int write_rc;
 
     memset(&files, 0, sizeof files);
-    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0) return;
-    if (path_join(staged_local, sizeof staged_local, stage, local_dir) != 0) return;
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0) return -1;
+    if (path_join(staged_local, sizeof staged_local, stage, local_dir) != 0) {
+        return -1;
+    }
 
     if (lstat(staged_local, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (allow_untracked) {
+            fprintf(stderr,
+                    "[Dreams] Warning: build system ignored DESTDIR; no manifest written.\n");
+            return 0;
+        }
         fprintf(stderr,
-                "[Dreams] Warning: build system ignored DESTDIR; no manifest written.\n");
-        return;
+                "[Dreams] Error: build system ignored DESTDIR; refusing an untracked install.\n");
+        fprintf(stderr,
+                "[Dreams] Fix the install rule or pass --allow-untracked to accept it.\n");
+        return -1;
     }
 
     if (!pkg_name || !*pkg_name) {
-        if (move_tree(staged_local, local_dir, &files, uid, gid) != 0) {
-            fprintf(stderr,
-                    "[Dreams] Warning: some staged files could not be installed.\n");
-        }
-        if (getuid() == 0) {
-            chown_with_parents(local_dir, home, uid, gid);
-        }
+        move_rc = move_tree(staged_local, local_dir, &files, uid, gid);
+        if (getuid() == 0) chown_with_parents(local_dir, home, uid, gid);
         strlist_free(&files);
-        return;
+        if (move_rc != 0) {
+            fprintf(stderr, "[Dreams] Error: some staged files could not be installed.\n");
+            return -1;
+        }
+        return 0;
     }
 
     if (path_join(manifest_dir, sizeof manifest_dir, home,
                   ".local/share/illus") != 0) {
-        return;
+        return -1;
     }
     if (mkdir_p(manifest_dir, 0755) != 0) {
-        perror("[Dreams] Warning: could not create manifest directory");
-        return;
+        perror("[Dreams] Error: could not create manifest directory");
+        return -1;
     }
-    if (make_filename(filename, sizeof filename, pkg_name, ".txt") != 0) return;
-    if (path_join(manifest_file, sizeof manifest_file, manifest_dir, filename) != 0) {
-        return;
+    if (make_filename(filename, sizeof filename, pkg_name, ".txt") != 0) {
+        return -1;
     }
-
-    load_manifest(&files, manifest_file, local_dir, manifest_dir);
-
-    if (move_tree(staged_local, local_dir, &files, uid, gid) != 0) {
-        fprintf(stderr,
-                "[Dreams] Warning: some staged files could not be installed.\n");
+    if (path_join(manifest_file, sizeof manifest_file, manifest_dir,
+                  filename) != 0) {
+        return -1;
     }
 
-    mf = fopen(manifest_file, "w");
-    if (!mf) {
-        perror("[Dreams] Warning: could not write manifest");
-        strlist_free(&files);
-        return;
-    }
-    for (i = 0; i < files.len; i++) {
-        fprintf(mf, "%s\n", files.items[i]);
-    }
-    fclose(mf);
+    /* Keep ownership of files from the previous version that still exist. */
+    manifest_read(&files, NULL, NULL, manifest_file, local_dir, manifest_dir);
+    manifest_filter_existing(&files);
 
-    if (getuid() == 0) {
+    move_rc = move_tree(staged_local, local_dir, &files, uid, gid);
+    if (move_rc != 0) {
+        fprintf(stderr, "[Dreams] Error: some staged files could not be installed.\n");
+    }
+
+    write_rc = manifest_write_atomic(manifest_file, local_dir, meta, &files);
+    if (write_rc != 0) {
+        fprintf(stderr, "[Dreams] Error: could not write package manifest.\n");
+    } else if (getuid() == 0) {
         chown_with_parents(manifest_file, local_dir, uid, gid);
     }
 
-    printf("[Dreams] Manifest created for package: %s (%zu files)\n",
-           pkg_name, files.len);
+    if (move_rc == 0 && write_rc == 0) {
+        printf("[Dreams] Manifest created for package: %s (%zu files)\n",
+               pkg_name, files.len);
+    }
+    strlist_free(&files);
+    return (move_rc == 0 && write_rc == 0) ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Git helpers                                                               */
+/* ------------------------------------------------------------------------- */
+
+static int git_clone(const illus_options *opts, const char *url,
+                     const char *target) {
+    char *argv[16];
+    char depth[32];
+    int n = 0;
+
+    argv[n++] = "git";
+    argv[n++] = "clone";
+    if (opts->depth > 0) {
+        snprintf(depth, sizeof depth, "%d", opts->depth);
+        argv[n++] = "--depth";
+        argv[n++] = depth;
+    }
+    if (opts->branch && *opts->branch) {
+        argv[n++] = "--branch";
+        argv[n++] = (char *)opts->branch;
+    }
+    if (opts->recursive) argv[n++] = "--recursive";
+    /* "--" prevents a URL that looks like an option from being parsed as one. */
+    argv[n++] = "--";
+    argv[n++] = (char *)url;
+    argv[n++] = (char *)target;
+    argv[n] = NULL;
+    return run_cmd(argv);
+}
+
+static int git_pull_ff(const char *dir) {
+    char *argv[] = {"git", "-C", (char *)dir, "pull", "--ff-only", NULL};
+    return run_cmd(argv);
+}
+
+/*
+ * Fetch and check out the requested ref, then fast-forward it when it is a
+ * branch. Tags and raw commits end up detached, where "git pull" does not
+ * apply; the checkout itself is the update in that case.
+ */
+static int git_update_ref(const char *dir, const char *ref) {
+    char *fetch_argv[] = {
+        "git", "-C", (char *)dir, "fetch", "--all", "--tags", NULL
+    };
+    char *checkout_argv[] = {
+        "git", "-C", (char *)dir, "checkout", (char *)ref, NULL
+    };
+    char *symbolic_argv[] = {
+        "git", "-C", (char *)dir, "symbolic-ref", "-q", "HEAD", NULL
+    };
+
+    if (!ref || !*ref) return git_pull_ff(dir);
+    if (run_cmd(fetch_argv) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not fetch updates for %s.\n", dir);
+        return -1;
+    }
+    if (run_cmd(checkout_argv) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not check out '%s'.\n", ref);
+        return -1;
+    }
+    /* symbolic-ref exits non-zero for a detached HEAD (tag or commit). */
+    if (run_cmd(symbolic_argv) != 0) return 0;
+    return git_pull_ff(dir);
+}
+
+/* Clone into a temporary sibling, then swap it into place atomically. */
+static int clone_atomic(const illus_options *opts, const char *url,
+                        const char *target, int force, const char *home,
+                        uid_t uid, gid_t gid) {
+    char parent[PATH_MAX];
+    char tmp[PATH_MAX];
+    char backup[PATH_MAX];
+    struct stat st;
+    int exists;
+
+    if (parent_dir(target, parent, sizeof parent) != 0) return -1;
+    if (path_join(tmp, sizeof tmp, parent, ".illus-clone-XXXXXX") != 0) return -1;
+    if (!mkdtemp(tmp)) {
+        perror("[Dreams] Error: could not create clone directory");
+        return -1;
+    }
+
+    printf("[Dreams] Cloning into %s...\n", target);
+    if (git_clone(opts, url, tmp) != 0) {
+        remove_directory(tmp);
+        fprintf(stderr, "[Dreams] Error: git clone failed.\n");
+        return -1;
+    }
+
+    exists = (lstat(target, &st) == 0);
+    if (exists) {
+        if (!force) {
+            remove_directory(tmp);
+            fprintf(stderr, "[Dreams] Error: destination already exists: %s\n",
+                    target);
+            fprintf(stderr, "[Dreams] Use --force to replace it.\n");
+            return -1;
+        }
+        if (path_join(backup, sizeof backup, parent, ".illus-old-XXXXXX") != 0 ||
+            !mkdtemp(backup)) {
+            remove_directory(tmp);
+            perror("[Dreams] Error: could not create backup directory");
+            return -1;
+        }
+        if (rmdir(backup) != 0) {
+            /* best effort */
+        }
+        if (rename(target, backup) != 0) {
+            perror("[Dreams] Error: could not move existing destination aside");
+            remove_directory(tmp);
+            return -1;
+        }
+        if (rename(tmp, target) != 0) {
+            perror("[Dreams] Error: could not move new clone into place");
+            rename(backup, target);
+            remove_directory(tmp);
+            return -1;
+        }
+        remove_path(backup);
+    } else if (rename(tmp, target) != 0) {
+        perror("[Dreams] Error: could not move clone into place");
+        remove_directory(tmp);
+        return -1;
+    }
+
+    if (getuid() == 0) {
+        recursive_chown(target, uid, gid);
+        chown_with_parents(target, home, uid, gid);
+    }
+    return 0;
+}
+
+/* Resolve the destination for pull/install, enforcing the same safety rules. */
+static int resolve_pull_target(const illus_options *opts, const char *home,
+                               const char *name, char *target,
+                               size_t target_size) {
+    if (opts->dir && *opts->dir) {
+        char *expanded = expand_path(opts->dir, home);
+        char parent[PATH_MAX];
+        char cwd[PATH_MAX];
+
+        if (!expanded) {
+            fprintf(stderr, "[Dreams] Error: invalid --dir path.\n");
+            return -1;
+        }
+        if (has_dotdot(expanded)) {
+            fprintf(stderr, "[Dreams] Error: --dir must not contain '..'.\n");
+            free(expanded);
+            return -1;
+        }
+        if (is_protected_target(expanded, home)) {
+            fprintf(stderr,
+                    "[Dreams] Error: refusing to use protected directory: %s\n",
+                    expanded);
+            free(expanded);
+            return -1;
+        }
+        if (getcwd(cwd, sizeof cwd) && strcmp(expanded, cwd) == 0) {
+            fprintf(stderr,
+                    "[Dreams] Error: refusing to use the current directory as a destination.\n");
+            free(expanded);
+            return -1;
+        }
+        if (parent_dir(expanded, parent, sizeof parent) != 0) {
+            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+            free(expanded);
+            return -1;
+        }
+        if (check_existing_ancestor(parent, home) != 0) {
+            fprintf(stderr,
+                    "[Dreams] Error: refusing to create destination under system path: %s\n",
+                    parent);
+            free(expanded);
+            return -1;
+        }
+        if (!opts->dry_run && mkdir_p(parent, 0755) != 0) {
+            perror("[Dreams] Error: could not create destination parent");
+            free(expanded);
+            return -1;
+        }
+        if (!opts->dry_run) {
+            char resolved_parent[PATH_MAX];
+            char resolved_home[PATH_MAX];
+            const char *safe_home = home;
+
+            if (realpath(home, resolved_home)) safe_home = resolved_home;
+            if (!realpath(parent, resolved_parent)) {
+                perror("[Dreams] Error: could not resolve destination parent");
+                free(expanded);
+                return -1;
+            }
+            if (is_system_area(resolved_parent) &&
+                !is_within(resolved_parent, safe_home)) {
+                fprintf(stderr,
+                        "[Dreams] Error: refusing to clone into system directory: %s\n",
+                        resolved_parent);
+                free(expanded);
+                return -1;
+            }
+        }
+        if (strlen(expanded) + 1 > target_size) {
+            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+            free(expanded);
+            return -1;
+        }
+        strcpy(target, expanded);
+        free(expanded);
+        return 0;
+    }
+
+    {
+        char dreams_dir[PATH_MAX];
+        char target_buf[PATH_MAX];
+        struct stat st;
+
+        if (path_join(dreams_dir, sizeof dreams_dir, home, "Dreams") != 0 ||
+            path_join(target_buf, sizeof target_buf, dreams_dir, name) != 0) {
+            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+            return -1;
+        }
+        if (lstat(dreams_dir, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                fprintf(stderr,
+                        "[Dreams] Error: ~/Dreams is a symlink; refusing to continue.\n");
+                return -1;
+            }
+            if (!S_ISDIR(st.st_mode)) {
+                fprintf(stderr,
+                        "[Dreams] Error: ~/Dreams exists but is not a directory.\n");
+                return -1;
+            }
+        } else if (!opts->dry_run && mkdir_p(dreams_dir, 0755) != 0) {
+            perror("[Dreams] Error: could not create ~/Dreams");
+            return -1;
+        }
+        if (strlen(target_buf) + 1 > target_size) {
+            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+            return -1;
+        }
+        strcpy(target, target_buf);
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Registry                                                                  */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char name[256];
+    char url[PATH_MAX];
+    char branch[256];
+    char description[512];
+} registry_entry;
+
+static const char *registry_source(const illus_options *opts) {
+    const char *env = getenv("ILLUS_REGISTRY");
+
+    if (opts && opts->registry && *opts->registry) return opts->registry;
+    if (env && *env) return env;
+    return DEFAULT_REGISTRY_URL;
+}
+
+static int registry_cache_dir(const char *home, char *out, size_t out_size) {
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    char base[PATH_MAX];
+
+    if (xdg && xdg[0] == '/') {
+        if (strlen(xdg) + 1 > sizeof base) return -1;
+        strcpy(base, xdg);
+    } else if (path_join(base, sizeof base, home, ".cache") != 0) {
+        return -1;
+    }
+    return path_join(out, out_size, base, "illus/registry");
+}
+
+static int registry_ensure(const illus_options *opts, const char *home,
+                           char *root, size_t root_size, int *is_file) {
+    const char *source = registry_source(opts);
+    struct stat st;
+
+    *is_file = 0;
+    if (stat(source, &st) == 0) {
+        if (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode)) {
+            if (strlen(source) + 1 > root_size) return -1;
+            strcpy(root, source);
+            *is_file = S_ISREG(st.st_mode) ? 1 : 0;
+            return 0;
+        }
+        fprintf(stderr,
+                "[Dreams] Error: registry path is not a file or directory: %s\n",
+                source);
+        return -1;
+    }
+    if (!looks_like_url(source)) {
+        fprintf(stderr, "[Dreams] Error: registry not found: %s\n", source);
+        return -1;
+    }
+    if (registry_cache_dir(home, root, root_size) != 0) {
+        fprintf(stderr, "[Dreams] Error: registry cache path is too long.\n");
+        return -1;
+    }
+
+    {
+        char git_dir[PATH_MAX];
+        struct stat cache_st;
+        int need_update = opts->refresh;
+
+        if (path_join(git_dir, sizeof git_dir, root, ".git") != 0) return -1;
+        if (stat(git_dir, &cache_st) != 0) {
+            char parent[PATH_MAX];
+            char *argv[8];
+            int n = 0;
+            struct stat root_st;
+
+            /*
+             * A previous clone may have been interrupted, leaving a partial
+             * directory without .git. It cannot be reused, and git clone
+             * refuses a non-empty destination, so remove it first.
+             */
+            if (lstat(root, &root_st) == 0) {
+                if (S_ISLNK(root_st.st_mode) || !S_ISDIR(root_st.st_mode)) {
+                    if (unlink(root) != 0) {
+                        perror("[Dreams] Error: could not clear registry cache");
+                        return -1;
+                    }
+                } else {
+                    remove_directory(root);
+                }
+            }
+
+            if (parent_dir(root, parent, sizeof parent) != 0) return -1;
+            if (mkdir_p(parent, 0755) != 0) {
+                perror("[Dreams] Error: could not create registry cache");
+                return -1;
+            }
+            printf("[Dreams] Fetching package registry from %s...\n", source);
+            argv[n++] = "git";
+            argv[n++] = "clone";
+            argv[n++] = "--depth";
+            argv[n++] = "1";
+            argv[n++] = "--";
+            argv[n++] = (char *)source;
+            argv[n++] = (char *)root;
+            argv[n] = NULL;
+            if (run_cmd(argv) != 0) {
+                fprintf(stderr, "[Dreams] Error: could not fetch registry.\n");
+                remove_directory(root);
+                return -1;
+            }
+        } else {
+            if (!need_update && stat(root, &cache_st) == 0) {
+                time_t now = time(NULL);
+                if (now - cache_st.st_mtime > REGISTRY_MAX_AGE) need_update = 1;
+            }
+            if (need_update) {
+                printf("[Dreams] Refreshing package registry...\n");
+                if (git_pull_ff(root) != 0) {
+                    fprintf(stderr,
+                            "[Dreams] Warning: could not refresh registry; using cached copy.\n");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int registry_file(const char *root, int is_file, char *out,
+                         size_t out_size) {
+    char candidate[PATH_MAX];
+
+    if (is_file) {
+        if (strlen(root) + 1 > out_size) return -1;
+        strcpy(out, root);
+        return 0;
+    }
+    if (path_join(candidate, sizeof candidate, root,
+                  REGISTRY_SUBDIR "/" REGISTRY_FILE) == 0 &&
+        access(candidate, R_OK) == 0) {
+        if (strlen(candidate) + 1 > out_size) return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
+    if (path_join(candidate, sizeof candidate, root, REGISTRY_FILE) == 0 &&
+        access(candidate, R_OK) == 0) {
+        if (strlen(candidate) + 1 > out_size) return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
+    fprintf(stderr, "[Dreams] Error: registry file not found under %s\n", root);
+    return -1;
+}
+
+static FILE *registry_open(const illus_options *opts, const char *home) {
+    char root[PATH_MAX];
+    char file[PATH_MAX];
+    int is_file = 0;
+    FILE *f;
+
+    if (registry_ensure(opts, home, root, sizeof root, &is_file) != 0) return NULL;
+    if (registry_file(root, is_file, file, sizeof file) != 0) return NULL;
+    f = fopen(file, "r");
+    if (!f) perror("[Dreams] Error: could not open registry");
+    return f;
+}
+
+static int parse_registry_line(char *line, registry_entry *entry) {
+    char *fields[4];
+    int n = 0;
+    char *p = line;
+
+    while (n < 4) {
+        char *tab = strchr(p, '\t');
+        fields[n++] = p;
+        if (!tab) break;
+        *tab = '\0';
+        p = tab + 1;
+    }
+    if (n < 2) return -1;
+    if (!is_valid_name(fields[0])) return -1;
+    if (validate_repo_url(fields[1]) != 0) return -1;
+
+    memset(entry, 0, sizeof *entry);
+    copy_field(entry->name, sizeof entry->name, fields[0]);
+    copy_field(entry->url, sizeof entry->url, fields[1]);
+    if (n > 2) copy_field(entry->branch, sizeof entry->branch, fields[2]);
+    if (n > 3) copy_field(entry->description, sizeof entry->description, fields[3]);
+    return 0;
+}
+
+/* Returns 0 when found, 1 when absent, -1 on registry errors. */
+static int registry_lookup(const illus_options *opts, const char *home,
+                           const char *name, registry_entry *out) {
+    FILE *f = registry_open(opts, home);
+    char line[2048];
+    int found = 0;
+
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f)) {
+        registry_entry entry;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        if (parse_registry_line(line, &entry) != 0) continue;
+        if (strcmp(entry.name, name) == 0) {
+            *out = entry;
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Installed package scanning                                                */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char name[256];
+    char manifest[PATH_MAX];
+    size_t file_count;
+    size_t missing;
+    size_t unsafe;
+    unsigned long long bytes;
+    manifest_meta meta;
+} package_info;
+
+static void package_scan(package_info *pkg, const char *local_dir) {
+    strlist files;
+    size_t i;
+
+    memset(&files, 0, sizeof files);
+    if (manifest_read(&files, &pkg->meta, &pkg->unsafe, pkg->manifest,
+                      local_dir, NULL) != 0) {
+        strlist_free(&files);
+        return;
+    }
+    pkg->file_count = files.len;
+    for (i = 0; i < files.len; i++) {
+        struct stat st;
+        if (lstat(files.items[i], &st) != 0) {
+            pkg->missing++;
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            pkg->bytes += (unsigned long long)st.st_size;
+        }
+    }
     strlist_free(&files);
 }
+
+static int package_compare(const void *a, const void *b) {
+    const package_info *pa = (const package_info *)a;
+    const package_info *pb = (const package_info *)b;
+
+    return strcmp(pa->name, pb->name);
+}
+
+static int collect_packages(const char *manifest_dir, const char *local_dir,
+                            package_info **out, size_t *out_count) {
+    DIR *d;
+    struct dirent *entry;
+    package_info *items = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+
+    *out = NULL;
+    *out_count = 0;
+    d = opendir(manifest_dir);
+    if (!d) {
+        if (errno == ENOENT) return 0;
+        perror("[Dreams] Error: could not read manifest directory");
+        return -1;
+    }
+    while ((entry = readdir(d)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        char manifest[PATH_MAX];
+        package_info *grown;
+
+        if (len < 5 || strcmp(entry->d_name + len - 4, ".txt") != 0) continue;
+        if (len - 4 >= sizeof items[0].name) continue;
+        if (path_join(manifest, sizeof manifest, manifest_dir,
+                      entry->d_name) != 0) {
+            continue;
+        }
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 8;
+            grown = realloc(items, ncap * sizeof *grown);
+            if (!grown) {
+                free(items);
+                closedir(d);
+                return -1;
+            }
+            items = grown;
+            cap = ncap;
+        }
+        memset(&items[count], 0, sizeof items[count]);
+        memcpy(items[count].name, entry->d_name, len - 4);
+        items[count].name[len - 4] = '\0';
+        strcpy(items[count].manifest, manifest);
+        package_scan(&items[count], local_dir);
+        count++;
+    }
+    closedir(d);
+    if (count > 1) {
+        qsort(items, count, sizeof *items, package_compare);
+    }
+    *out = items;
+    *out_count = count;
+    return 0;
+}
+
+static int binary_is_tracked(const package_info *pkgs, size_t count,
+                             const char *binary) {
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        FILE *f = fopen(pkgs[i].manifest, "r");
+        char line[PATH_MAX];
+
+        if (!f) continue;
+        while (fgets(line, sizeof line, f)) {
+            const char *base;
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0] || line[0] == '#') continue;
+            base = strrchr(line, '/');
+            base = base ? base + 1 : line;
+            if (strcmp(base, binary) == 0) {
+                fclose(f);
+                return 1;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+static void manifest_package_name(const char *manifest, char *out,
+                                  size_t out_size) {
+    const char *base = strrchr(manifest, '/');
+    size_t len;
+
+    base = base ? base + 1 : manifest;
+    len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".txt") == 0) len -= 4;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, base, len);
+    out[len] = '\0';
+}
+
+static int string_compare(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Collect and sort untracked executable names from ~/.local/bin. */
+static int collect_untracked(const package_info *pkgs, size_t count,
+                             const char *bin_dir, strlist *names) {
+    DIR *d = opendir(bin_dir);
+    struct dirent *entry;
+
+    if (!d) return 0;
+    while ((entry = readdir(d)) != NULL) {
+        char path[PATH_MAX];
+        struct stat st;
+
+        if (entry->d_name[0] == '.') continue;
+        if (path_join(path, sizeof path, bin_dir, entry->d_name) != 0) continue;
+        if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) continue;
+        if (binary_is_tracked(pkgs, count, entry->d_name)) continue;
+        if (strlist_add(names, entry->d_name) != 0) {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
+    if (names->len > 1) {
+        qsort(names->items, names->len, sizeof *names->items, string_compare);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Pull command                                                              */
 /* ------------------------------------------------------------------------- */
 
-int cmd_pull(int argc, char *argv[]) {
-    const char *url;
-    const char *dir_arg = NULL;
-    int force = 0;
-    int i;
+int cmd_pull(const illus_options *opts, const char *url) {
     uid_t uid = 0;
     gid_t gid = 0;
     char *home;
     char repo_name[256];
-    size_t name_len;
-    char *target = NULL;
+    char target[PATH_MAX];
+    struct stat st;
 
-    if (argc < 3) {
-        fprintf(stderr, "[Dreams] Usage: illus --pull <url> [--dir <path>] [--force]\n");
+    if (refuse_root("pull")) return 1;
+    if (validate_repo_url(url) != 0) {
+        fprintf(stderr, "[Dreams] Error: invalid repository URL.\n");
         return 1;
-    }
-
-    url = argv[2];
-    for (i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--force") == 0) {
-            force = 1;
-        } else if (strcmp(argv[i], "--dir") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "[Dreams] Error: --dir requires a path.\n");
-                return 1;
-            }
-            dir_arg = argv[++i];
-        } else {
-            fprintf(stderr, "[Dreams] Warning: Unknown flag for --pull: %s\n", argv[i]);
-        }
     }
 
     home = get_real_home(&uid, &gid);
@@ -773,210 +1798,74 @@ int cmd_pull(int argc, char *argv[]) {
         fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
         return 1;
     }
-    printf("[Dreams] Pulling repository from: %s\n", url);
 
-    {
-        size_t url_len = strlen(url);
-        const char *name_end;
-        const char *name_start;
-
-        while (url_len > 0 && url[url_len - 1] == '/') url_len--;
-        name_end = url + url_len;
-        name_start = name_end;
-        while (name_start > url && name_start[-1] != '/') name_start--;
-        if (name_start == url) {
-            fprintf(stderr, "[Dreams] Error: Invalid repository URL format.\n");
+    if (opts->name && *opts->name) {
+        if (!is_valid_name(opts->name)) {
+            fprintf(stderr, "[Dreams] Error: invalid --name '%s'.\n", opts->name);
             free(home);
             return 1;
         }
-        name_len = (size_t)(name_end - name_start);
-        if (name_len == 0 || name_len >= sizeof repo_name) {
-            fprintf(stderr, "[Dreams] Error: Repository name is too long.\n");
-            free(home);
-            return 1;
-        }
-        memcpy(repo_name, name_start, name_len);
-        repo_name[name_len] = '\0';
-        if (name_len > 4 && strcmp(repo_name + name_len - 4, ".git") == 0) {
-            repo_name[name_len - 4] = '\0';
-        }
-    }
-    if (!is_valid_name(repo_name)) {
-        fprintf(stderr, "[Dreams] Error: Extracted repository name is invalid.\n");
+        strcpy(repo_name, opts->name);
+    } else if (derive_repo_name(url, repo_name, sizeof repo_name) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not derive a repository name from the URL.\n");
+        fprintf(stderr, "[Dreams] Use --name <pkg> to set one.\n");
         free(home);
         return 1;
     }
 
-    if (dir_arg) {
-        target = expand_path(dir_arg, home);
-        if (!target) {
-            fprintf(stderr, "[Dreams] Error: Invalid --dir path.\n");
-            free(home);
-            return 1;
-        }
-        if (has_dotdot(target)) {
-            fprintf(stderr, "[Dreams] Error: --dir must not contain '..'.\n");
-            free(target);
-            free(home);
-            return 1;
-        }
-        if (is_protected_target(target, home)) {
-            fprintf(stderr, "[Dreams] Error: refusing to use protected directory: %s\n",
+    if (resolve_pull_target(opts, home, repo_name, target,
+                            sizeof target) != 0) {
+        free(home);
+        return 1;
+    }
+
+    if (lstat(target, &st) == 0) {
+        if (!opts->force) {
+            fprintf(stderr, "[Dreams] Error: destination already exists: %s\n",
                     target);
-            free(target);
+            fprintf(stderr, "[Dreams] Use --force to replace it.\n");
             free(home);
             return 1;
         }
-        {
-            char cwd[PATH_MAX];
-            if (getcwd(cwd, sizeof cwd) && strcmp(target, cwd) == 0) {
-                fprintf(stderr, "[Dreams] Error: refusing to use the current directory as a destination.\n");
-                free(target);
+        if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+            char resolved_target[PATH_MAX];
+            char resolved_home[PATH_MAX];
+            const char *safe_home = home;
+
+            if (realpath(home, resolved_home)) safe_home = resolved_home;
+            if (!realpath(target, resolved_target)) {
+                perror("[Dreams] Error: could not resolve existing destination");
                 free(home);
                 return 1;
             }
-        }
-        {
-            char parent[PATH_MAX];
-            if (parent_dir(target, parent, sizeof parent) != 0) {
-                fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
-                free(target);
-                free(home);
-                return 1;
-            }
-            if (check_existing_ancestor(parent, home) != 0) {
+            if (!replace_allowed(resolved_target, safe_home)) {
                 fprintf(stderr,
-                        "[Dreams] Error: refusing to create destination under system path: %s\n",
-                        parent);
-                free(target);
+                        "[Dreams] Error: refusing to recursively remove %s\n",
+                        resolved_target);
+                fprintf(stderr,
+                        "[Dreams] Choose a destination inside your home directory or /tmp.\n");
                 free(home);
                 return 1;
-            }
-            if (mkdir_p(parent, 0755) != 0) {
-                perror("[Dreams] Error: could not create destination parent");
-                free(target);
-                free(home);
-                return 1;
-            }
-            {
-                char resolved_parent[PATH_MAX];
-                char resolved_home[PATH_MAX];
-                const char *safe_home = home;
-
-                if (realpath(home, resolved_home)) safe_home = resolved_home;
-                if (!realpath(parent, resolved_parent)) {
-                    perror("[Dreams] Error: could not resolve destination parent");
-                    free(target);
-                    free(home);
-                    return 1;
-                }
-                if (is_system_area(resolved_parent) &&
-                    !is_within(resolved_parent, safe_home)) {
-                    fprintf(stderr,
-                            "[Dreams] Error: refusing to clone into system directory: %s\n",
-                            resolved_parent);
-                    free(target);
-                    free(home);
-                    return 1;
-                }
             }
         }
-    } else {
-        char dreams_dir[PATH_MAX];
-        char target_buf[PATH_MAX];
-        struct stat st;
-
-        if (path_join(dreams_dir, sizeof dreams_dir, home, "Dreams") != 0 ||
-            path_join(target_buf, sizeof target_buf, dreams_dir, repo_name) != 0) {
-            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+        if (opts->dry_run) {
+            printf("[Dreams] Dry run: would replace %s with a clone of %s\n",
+                   target, url);
             free(home);
-            return 1;
+            return 0;
         }
-        if (lstat(dreams_dir, &st) == 0) {
-            if (S_ISLNK(st.st_mode)) {
-                fprintf(stderr, "[Dreams] Error: ~/Dreams is a symlink; refusing to continue.\n");
-                free(home);
-                return 1;
-            }
-            if (!S_ISDIR(st.st_mode)) {
-                fprintf(stderr, "[Dreams] Error: ~/Dreams exists but is not a directory.\n");
-                free(home);
-                return 1;
-            }
-        } else if (mkdir_p(dreams_dir, 0755) != 0) {
-            perror("[Dreams] Error: could not create ~/Dreams");
-            free(home);
-            return 1;
-        }
-        target = strdup(target_buf);
-        if (!target) {
-            fprintf(stderr, "[Dreams] Error: out of memory.\n");
-            free(home);
-            return 1;
-        }
+    } else if (opts->dry_run) {
+        printf("[Dreams] Dry run: would clone %s into %s\n", url, target);
+        free(home);
+        return 0;
     }
 
-    {
-        struct stat st;
-        if (lstat(target, &st) == 0) {
-            if (!force) {
-                fprintf(stderr, "[Dreams] Error: destination already exists: %s\n", target);
-                fprintf(stderr, "[Dreams] Use --force to replace it.\n");
-                free(target);
-                free(home);
-                return 1;
-            }
-            if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
-                char resolved_target[PATH_MAX];
-                char resolved_home[PATH_MAX];
-                const char *safe_home = home;
-
-                if (realpath(home, resolved_home)) safe_home = resolved_home;
-                if (!realpath(target, resolved_target)) {
-                    perror("[Dreams] Error: could not resolve existing destination");
-                    free(target);
-                    free(home);
-                    return 1;
-                }
-                if (!replace_allowed(resolved_target, safe_home)) {
-                    fprintf(stderr,
-                            "[Dreams] Error: refusing to recursively remove %s\n",
-                            resolved_target);
-                    fprintf(stderr,
-                            "[Dreams] Choose a destination inside your home directory or /tmp.\n");
-                    free(target);
-                    free(home);
-                    return 1;
-                }
-                remove_directory(resolved_target);
-            } else if (unlink(target) != 0) {
-                perror("[Dreams] Error: could not remove existing destination");
-                free(target);
-                free(home);
-                return 1;
-            }
-        }
-    }
-
-    printf("[Dreams] Cloning into %s...\n", target);
-    {
-        char *const clone_argv[] = {"git", "clone", (char *)url, target, NULL};
-        int status = run_cmd(clone_argv);
-        if (status != 0) {
-            fprintf(stderr, "[Dreams] Error: git clone failed.\n");
-            free(target);
-            free(home);
-            return status;
-        }
-    }
-
-    if (getuid() == 0) {
-        recursive_chown(target, uid, gid);
-        chown_with_parents(target, home, uid, gid);
+    if (clone_atomic(opts, url, target, opts->force, home, uid, gid) != 0) {
+        free(home);
+        return 1;
     }
 
     printf("[Dreams] Successfully pulled and stored in %s\n", target);
-    free(target);
     free(home);
     return 0;
 }
@@ -985,10 +1874,10 @@ int cmd_pull(int argc, char *argv[]) {
 /* Cast command                                                              */
 /* ------------------------------------------------------------------------- */
 
-int cmd_cast(int store, int fresh) {
+int cmd_cast(const illus_options *opts) {
     uid_t uid = 0;
     gid_t gid = 0;
-    char *home = get_real_home(&uid, &gid);
+    char *home;
     char workspace[PATH_MAX];
     char local_dir[PATH_MAX];
     char stage[PATH_MAX];
@@ -996,24 +1885,33 @@ int cmd_cast(int store, int fresh) {
     char makefile_path[PATH_MAX];
     char build_dir[PATH_MAX];
     char pkg_name[256];
+    char jobs_buf[32];
     const char *base;
     size_t base_len;
     int can_track;
     int is_cmake;
     int is_makefile;
+    int rc = 0;
+    manifest_meta meta;
 
+    if (refuse_root(opts->store ? "cast --store" : "cast")) return 1;
+
+    home = get_real_home(&uid, &gid);
     if (!home) {
         fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
         return 1;
     }
     if (!getcwd(workspace, sizeof workspace)) {
-        fprintf(stderr, "[Dreams] Error: Could not determine current working directory.\n");
+        fprintf(stderr,
+                "[Dreams] Error: Could not determine current working directory.\n");
         free(home);
         return 1;
     }
     if (path_join(local_dir, sizeof local_dir, home, ".local") != 0 ||
-        path_join(cmake_path, sizeof cmake_path, workspace, "CMakeLists.txt") != 0 ||
-        path_join(makefile_path, sizeof makefile_path, workspace, "Makefile") != 0 ||
+        path_join(cmake_path, sizeof cmake_path, workspace,
+                  "CMakeLists.txt") != 0 ||
+        path_join(makefile_path, sizeof makefile_path, workspace,
+                  "Makefile") != 0 ||
         path_join(build_dir, sizeof build_dir, workspace, "build") != 0) {
         fprintf(stderr, "[Dreams] Error: path is too long.\n");
         free(home);
@@ -1022,25 +1920,95 @@ int cmd_cast(int store, int fresh) {
 
     is_cmake = (access(cmake_path, F_OK) == 0);
     is_makefile = (access(makefile_path, F_OK) == 0);
+
+    if (opts->build_system && *opts->build_system) {
+        if (strcmp(opts->build_system, "cmake") == 0) {
+            is_makefile = 0;
+            if (!is_cmake) {
+                fprintf(stderr,
+                        "[Dreams] Error: --build-system=cmake but no CMakeLists.txt found.\n");
+                free(home);
+                return 1;
+            }
+        } else if (strcmp(opts->build_system, "make") == 0) {
+            is_cmake = 0;
+            if (!is_makefile) {
+                fprintf(stderr,
+                        "[Dreams] Error: --build-system=make but no Makefile found.\n");
+                free(home);
+                return 1;
+            }
+        } else {
+            fprintf(stderr,
+                    "[Dreams] Error: --build-system must be 'make' or 'cmake'.\n");
+            free(home);
+            return 1;
+        }
+    }
+
     if (!is_cmake && !is_makefile) {
-        fprintf(stderr, "[Dreams] Error: No recognized build system found in current directory.\n");
+        fprintf(stderr,
+                "[Dreams] Error: No recognized build system found in current directory.\n");
         free(home);
         return 1;
     }
 
-    base = strrchr(workspace, '/');
-    base = base ? base + 1 : workspace;
-    base_len = strlen(base);
-    can_track = (base_len > 0 && base_len + 4 < sizeof pkg_name &&
-                 is_valid_name(base));
-    if (can_track) {
-        memcpy(pkg_name, base, base_len + 1);
+    if (opts->name && *opts->name) {
+        if (!is_valid_name(opts->name)) {
+            fprintf(stderr, "[Dreams] Error: invalid --name '%s'.\n", opts->name);
+            free(home);
+            return 1;
+        }
+        strcpy(pkg_name, opts->name);
+        can_track = 1;
     } else {
-        pkg_name[0] = '\0';
+        base = strrchr(workspace, '/');
+        base = base ? base + 1 : workspace;
+        base_len = strlen(base);
+        can_track = (base_len > 0 && base_len + 4 < sizeof pkg_name &&
+                     is_valid_name(base));
+        if (can_track) {
+            memcpy(pkg_name, base, base_len + 1);
+        } else {
+            pkg_name[0] = '\0';
+        }
     }
 
-    if (fresh) {
+    if (opts->store && !can_track && !opts->allow_untracked) {
+        fprintf(stderr,
+                "[Dreams] Error: cannot determine a valid package name from '%s'.\n",
+                workspace);
+        fprintf(stderr, "[Dreams] Use --name <pkg> or --allow-untracked.\n");
+        free(home);
+        return 1;
+    }
+
+    if (opts->jobs > 0) {
+        snprintf(jobs_buf, sizeof jobs_buf, "%d", opts->jobs);
+    }
+
+    manifest_meta_clear(&meta);
+    copy_field(meta.package, sizeof meta.package, pkg_name);
+    if (opts->source && *opts->source) {
+        copy_field(meta.source, sizeof meta.source, opts->source);
+    } else {
+        copy_field(meta.source, sizeof meta.source, workspace);
+    }
+    if (opts->branch && *opts->branch) {
+        copy_field(meta.branch, sizeof meta.branch, opts->branch);
+    }
+    {
+        time_t now = time(NULL);
+        struct tm *tmv = gmtime(&now);
+        if (tmv) {
+            strftime(meta.installed, sizeof meta.installed,
+                     "%Y-%m-%dT%H:%M:%SZ", tmv);
+        }
+    }
+
+    if (opts->fresh) {
         struct stat st;
+
         printf("[Dreams] Sweeping clean build artifacts (--fresh)...\n");
         if (lstat(build_dir, &st) == 0) {
             if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
@@ -1087,7 +2055,16 @@ int cmd_cast(int store, int fresh) {
                 return 1;
             }
         }
-        {
+        if (opts->jobs > 0) {
+            char *const build_argv[] = {
+                "cmake", "--build", build_dir, "--parallel", jobs_buf, NULL
+            };
+            if (run_cmd(build_argv) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        } else {
             char *const build_argv[] = {"cmake", "--build", build_dir, NULL};
             if (run_cmd(build_argv) != 0) {
                 fprintf(stderr, "[Dreams] Error: build failed.\n");
@@ -1095,11 +2072,14 @@ int cmd_cast(int store, int fresh) {
                 return 1;
             }
         }
-        if (store) {
-            char *const install_argv[] = {"cmake", "--install", build_dir, NULL};
+        if (opts->store) {
+            char *const install_argv[] = {
+                "cmake", "--install", build_dir, NULL
+            };
 
             if (make_stage_dir(home, stage, sizeof stage) != 0) {
-                fprintf(stderr, "[Dreams] Error: could not create staging directory.\n");
+                fprintf(stderr,
+                        "[Dreams] Error: could not create staging directory.\n");
                 free(home);
                 return 1;
             }
@@ -1111,16 +2091,33 @@ int cmd_cast(int store, int fresh) {
                 return 1;
             }
             if (can_track) {
-                track_install(home, pkg_name, stage, uid, gid);
+                if (track_install(home, pkg_name, stage, uid, gid, &meta,
+                                  opts->allow_untracked) != 0) {
+                    rc = -1;
+                }
             } else {
-                fprintf(stderr, "[Dreams] Warning: invalid package name; installing without a manifest.\n");
-                track_install(home, NULL, stage, uid, gid);
+                fprintf(stderr,
+                        "[Dreams] Warning: installing without a manifest (--allow-untracked).\n");
+                if (track_install(home, NULL, stage, uid, gid, NULL, 1) != 0) {
+                    rc = -1;
+                }
             }
             remove_directory(stage);
+            if (rc != 0) {
+                free(home);
+                return 1;
+            }
         }
     } else {
         printf("[Dreams] Detected Make build system.\n");
-        {
+        if (opts->jobs > 0) {
+            char *const make_argv[] = {"make", "-j", jobs_buf, NULL};
+            if (run_cmd(make_argv) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        } else {
             char *const make_argv[] = {"make", NULL};
             if (run_cmd(make_argv) != 0) {
                 fprintf(stderr, "[Dreams] Error: build failed.\n");
@@ -1128,7 +2125,7 @@ int cmd_cast(int store, int fresh) {
                 return 1;
             }
         }
-        if (store) {
+        if (opts->store) {
             char prefix_env[PATH_MAX];
             char destdir_env[PATH_MAX];
             const char *opt = "PREFIX=";
@@ -1140,7 +2137,8 @@ int cmd_cast(int store, int fresh) {
             char *install_argv[5];
 
             if (make_stage_dir(home, stage, sizeof stage) != 0) {
-                fprintf(stderr, "[Dreams] Error: could not create staging directory.\n");
+                fprintf(stderr,
+                        "[Dreams] Error: could not create staging directory.\n");
                 free(home);
                 return 1;
             }
@@ -1172,12 +2170,22 @@ int cmd_cast(int store, int fresh) {
                 return 1;
             }
             if (can_track) {
-                track_install(home, pkg_name, stage, uid, gid);
+                if (track_install(home, pkg_name, stage, uid, gid, &meta,
+                                  opts->allow_untracked) != 0) {
+                    rc = -1;
+                }
             } else {
-                fprintf(stderr, "[Dreams] Warning: invalid package name; installing without a manifest.\n");
-                track_install(home, NULL, stage, uid, gid);
+                fprintf(stderr,
+                        "[Dreams] Warning: installing without a manifest (--allow-untracked).\n");
+                if (track_install(home, NULL, stage, uid, gid, NULL, 1) != 0) {
+                    rc = -1;
+                }
             }
             remove_directory(stage);
+            if (rc != 0) {
+                free(home);
+                return 1;
+            }
         }
     }
 
@@ -1187,16 +2195,222 @@ int cmd_cast(int store, int fresh) {
     }
 
     printf("[Dreams] Successfully built%s project!\n",
-           store ? " and installed" : "");
+           opts->store ? " and installed" : "");
     free(home);
-    return 0;
+    return rc;
 }
+
+/* ------------------------------------------------------------------------- */
+/* Install command                                                           */
+/* ------------------------------------------------------------------------- */
+
+int cmd_install(const illus_options *opts, const char *spec) {
+    uid_t uid = 0;
+    gid_t gid = 0;
+    char *home;
+    char url[PATH_MAX];
+    char name[256];
+    char branch[256];
+    char target[PATH_MAX];
+    registry_entry entry;
+    struct stat st;
+    int rc;
+
+    if (refuse_root("install")) return 1;
+    if (!spec || !*spec) {
+        fprintf(stderr, "[Dreams] Error: install requires a package name or URL.\n");
+        return 1;
+    }
+
+    home = get_real_home(&uid, &gid);
+    if (!home) {
+        fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
+        return 1;
+    }
+
+    memset(&entry, 0, sizeof entry);
+    memset(url, 0, sizeof url);
+    memset(name, 0, sizeof name);
+    branch[0] = '\0';
+    if (opts->branch && *opts->branch) {
+        copy_field(branch, sizeof branch, opts->branch);
+    }
+
+    if (is_valid_name(spec) && !looks_like_url(spec)) {
+        rc = registry_lookup(opts, home, spec, &entry);
+        if (rc == 0) {
+            copy_field(url, sizeof url, entry.url);
+            copy_field(name, sizeof name, entry.name);
+            if (!branch[0] && entry.branch[0]) {
+                copy_field(branch, sizeof branch, entry.branch);
+            }
+        } else if (rc > 0) {
+            fprintf(stderr,
+                    "[Dreams] Error: package '%s' was not found in the registry.\n",
+                    spec);
+            fprintf(stderr,
+                    "[Dreams] Try 'illus search %s' or pass a repository URL.\n",
+                    spec);
+            free(home);
+            return 1;
+        } else {
+            free(home);
+            return 1;
+        }
+    } else {
+        copy_field(url, sizeof url, spec);
+        if (derive_repo_name(url, name, sizeof name) != 0) {
+            fprintf(stderr,
+                    "[Dreams] Error: could not derive a package name from the URL.\n");
+            fprintf(stderr, "[Dreams] Use --name <pkg> to set one.\n");
+            free(home);
+            return 1;
+        }
+    }
+
+    if (opts->name && *opts->name) {
+        if (!is_valid_name(opts->name)) {
+            fprintf(stderr, "[Dreams] Error: invalid --name '%s'.\n", opts->name);
+            free(home);
+            return 1;
+        }
+        copy_field(name, sizeof name, opts->name);
+    }
+    if (!is_valid_name(name)) {
+        fprintf(stderr, "[Dreams] Error: invalid package name '%s'.\n", name);
+        free(home);
+        return 1;
+    }
+    if (validate_repo_url(url) != 0) {
+        fprintf(stderr, "[Dreams] Error: invalid repository URL.\n");
+        free(home);
+        return 1;
+    }
+
+    if (resolve_pull_target(opts, home, name, target, sizeof target) != 0) {
+        free(home);
+        return 1;
+    }
+
+    if (lstat(target, &st) == 0) {
+        if (opts->force) {
+            if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+                char resolved_target[PATH_MAX];
+                char resolved_home[PATH_MAX];
+                const char *safe_home = home;
+
+                if (realpath(home, resolved_home)) safe_home = resolved_home;
+                if (!realpath(target, resolved_target)) {
+                    perror("[Dreams] Error: could not resolve existing destination");
+                    free(home);
+                    return 1;
+                }
+                if (!replace_allowed(resolved_target, safe_home)) {
+                    fprintf(stderr,
+                            "[Dreams] Error: refusing to recursively remove %s\n",
+                            resolved_target);
+                    free(home);
+                    return 1;
+                }
+            }
+            if (opts->dry_run) {
+                printf("[Dreams] Dry run: would replace %s with a clone of %s\n",
+                       target, url);
+                free(home);
+                return 0;
+            }
+            if (clone_atomic(opts, url, target, 1, home, uid, gid) != 0) {
+                free(home);
+                return 1;
+            }
+        } else {
+            char git_dir[PATH_MAX];
+
+            if (path_join(git_dir, sizeof git_dir, target, ".git") != 0 ||
+                access(git_dir, F_OK) != 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: destination exists but is not a git clone: %s\n",
+                        target);
+                fprintf(stderr, "[Dreams] Use --force to replace it.\n");
+                free(home);
+                return 1;
+            }
+            if (opts->dry_run) {
+                if (branch[0]) {
+                    printf("[Dreams] Dry run: would check out '%s' and update %s\n",
+                           branch, target);
+                } else {
+                    printf("[Dreams] Dry run: would update %s with git pull --ff-only\n",
+                           target);
+                }
+            } else {
+                printf("[Dreams] Updating %s...\n", target);
+                if (git_update_ref(target, branch) != 0) {
+                    fprintf(stderr, "[Dreams] Error: could not update %s.\n",
+                            target);
+                    free(home);
+                    return 1;
+                }
+            }
+        }
+    } else {
+        if (opts->dry_run) {
+            printf("[Dreams] Dry run: would clone %s into %s\n", url, target);
+            printf("[Dreams] Dry run: would build and install package '%s'\n", name);
+            free(home);
+            return 0;
+        }
+        if (clone_atomic(opts, url, target, 0, home, uid, gid) != 0) {
+            free(home);
+            return 1;
+        }
+    }
+
+    if (opts->dry_run) {
+        printf("[Dreams] Dry run: would %s package '%s'\n",
+               opts->reinstall ? "clean rebuild and install" : "build and install",
+               name);
+        free(home);
+        return 0;
+    }
+
+    {
+        char cwd[PATH_MAX];
+        illus_options cast_opts = *opts;
+
+        if (!getcwd(cwd, sizeof cwd)) {
+            perror("[Dreams] Error: could not determine current directory");
+            free(home);
+            return 1;
+        }
+        if (chdir(target) != 0) {
+            perror("[Dreams] Error: could not enter package directory");
+            free(home);
+            return 1;
+        }
+        cast_opts.store = 1;
+        cast_opts.fresh = opts->reinstall;
+        cast_opts.name = name;
+        cast_opts.source = url;
+        cast_opts.branch = branch[0] ? branch : NULL;
+        cast_opts.dir = NULL;
+        cast_opts.dry_run = 0;
+        rc = cmd_cast(&cast_opts);
+        if (chdir(cwd) != 0) {
+            perror("[Dreams] Warning: could not restore working directory");
+        }
+    }
+
+    free(home);
+    return rc;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Update command                                                            */
 /* ------------------------------------------------------------------------- */
 
-int cmd_update(void) {
-    char *home = get_real_home(NULL, NULL);
+int cmd_update(const illus_options *opts) {
+    char *home;
     char dreams_path[PATH_MAX];
     char cwd_buf[PATH_MAX];
     DIR *dir;
@@ -1204,6 +2418,9 @@ int cmd_update(void) {
     int found_repos = 0;
     int failures = 0;
 
+    if (refuse_root("update")) return 1;
+
+    home = get_real_home(NULL, NULL);
     if (!home) {
         fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
         return 1;
@@ -1214,7 +2431,8 @@ int cmd_update(void) {
         return 1;
     }
     if (!getcwd(cwd_buf, sizeof cwd_buf)) {
-        fprintf(stderr, "[Dreams] Error: could not determine current directory.\n");
+        fprintf(stderr,
+                "[Dreams] Error: could not determine current directory.\n");
         free(home);
         return 1;
     }
@@ -1241,58 +2459,76 @@ int cmd_update(void) {
         char makefile_path[PATH_MAX];
 
         if (entry->d_name[0] == '.') continue;
-        if (path_join(repo_path, sizeof repo_path, dreams_path, entry->d_name) != 0) {
+        if (path_join(repo_path, sizeof repo_path, dreams_path,
+                      entry->d_name) != 0) {
             continue;
         }
         if (path_join(git_dir, sizeof git_dir, repo_path, ".git") != 0) continue;
         if (access(git_dir, F_OK) != 0) continue;
 
         found_repos = 1;
-        printf("[Dreams] Updating project: %s\n", entry->d_name);
-
-        if (chdir(repo_path) != 0) {
-            perror("[Dreams] Error: could not enter project directory");
-            failures++;
+        if (opts->dry_run) {
+            printf("[Dreams] Dry run: would update %s\n", entry->d_name);
             continue;
         }
 
+        printf("[Dreams] Updating project: %s\n", entry->d_name);
         {
-            char *const pull_argv[] = {"git", "pull", NULL};
+            char *const pull_argv[] = {
+                "git", "-C", repo_path, "pull", "--ff-only", NULL
+            };
             if (run_cmd(pull_argv) != 0) {
-                printf("[Dreams] Error: 'git pull' failed for %s.\n", entry->d_name);
+                fprintf(stderr, "[Dreams] Error: 'git pull' failed for %s.\n",
+                        entry->d_name);
                 failures++;
-                if (chdir(cwd_buf) != 0) {
-                    perror("[Dreams] Warning: could not restore working directory");
-                }
                 continue;
             }
         }
 
-        if (path_join(cmake_path, sizeof cmake_path, repo_path, "CMakeLists.txt") != 0 ||
-            path_join(makefile_path, sizeof makefile_path, repo_path, "Makefile") != 0) {
-            fprintf(stderr, "[Dreams] Warning: path too long for %s.\n", entry->d_name);
+        if (path_join(cmake_path, sizeof cmake_path, repo_path,
+                      "CMakeLists.txt") != 0 ||
+            path_join(makefile_path, sizeof makefile_path, repo_path,
+                      "Makefile") != 0) {
+            fprintf(stderr, "[Dreams] Warning: path too long for %s.\n",
+                    entry->d_name);
             failures++;
-            if (chdir(cwd_buf) != 0) {
-                perror("[Dreams] Warning: could not restore working directory");
-            }
             continue;
         }
 
-        if (access(cmake_path, F_OK) == 0 || access(makefile_path, F_OK) == 0) {
-            if (cmd_cast(1, 0) != 0) {
-                printf("[Dreams] Error: rebuild/install failed for %s.\n", entry->d_name);
+        if (access(cmake_path, F_OK) == 0 ||
+            access(makefile_path, F_OK) == 0) {
+            illus_options cast_opts = *opts;
+
+            cast_opts.store = 1;
+            cast_opts.fresh = 0;
+            cast_opts.source = NULL;
+            cast_opts.branch = NULL;
+            cast_opts.name = NULL;
+            cast_opts.dir = NULL;
+            cast_opts.dry_run = 0;
+
+            if (chdir(repo_path) != 0) {
+                perror("[Dreams] Error: could not enter project directory");
+                failures++;
+                continue;
+            }
+            if (cmd_cast(&cast_opts) != 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: rebuild/install failed for %s.\n",
+                        entry->d_name);
                 failures++;
             } else {
-                printf("[Dreams] Successfully updated and rebuilt %s!\n\n", entry->d_name);
+                printf("[Dreams] Successfully updated and rebuilt %s!\n\n",
+                       entry->d_name);
+            }
+            if (chdir(cwd_buf) != 0) {
+                perror("[Dreams] Warning: could not restore working directory");
+                failures++;
             }
         } else {
-            printf("[Dreams] Pulled latest changes for %s (no build system found, skipping build).\n\n",
+            printf("[Dreams] Pulled latest changes for %s "
+                   "(no build system found, skipping build).\n\n",
                    entry->d_name);
-        }
-
-        if (chdir(cwd_buf) != 0) {
-            perror("[Dreams] Warning: could not restore working directory");
-            failures++;
         }
     }
     closedir(dir);
@@ -1309,13 +2545,15 @@ int cmd_update(void) {
 /* ------------------------------------------------------------------------- */
 
 int cmd_version(void) {
-    printf("\033[36m");
+    int color = use_color();
+
+    if (color) printf("\033[36m");
     printf("  ___ _ _            \n");
     printf(" |_ _| | |_   _ ___  \n");
     printf("  | || | | | | / __| \n");
     printf("  | || | | |_| \\__ \\ \n");
     printf(" |___|_|_|\\__,_|___/ \n\n");
-    printf("\033[0m");
+    if (color) printf("\033[0m");
     printf(" ✦ Dreams Package Manager (illus) v%s ✦\n", ILLUS_VERSION);
     return 0;
 }
@@ -1324,7 +2562,7 @@ int cmd_version(void) {
 /* Shed command                                                              */
 /* ------------------------------------------------------------------------- */
 
-int cmd_shed(const char *package_name) {
+int cmd_shed(const illus_options *opts, const char *package_name) {
     char *home;
     char local_dir[PATH_MAX];
     char manifest_dir[PATH_MAX];
@@ -1332,16 +2570,25 @@ int cmd_shed(const char *package_name) {
     char direct_manifest[PATH_MAX];
     char manifest_path[PATH_MAX] = "";
     char resolved_local[PATH_MAX];
-    char line[PATH_MAX];
-    FILE *f = NULL;
+    strlist files;
+    manifest_meta meta;
+    size_t unsafe = 0;
     int failures = 0;
+    size_t i;
+    FILE *f;
 
+    if (refuse_root("remove")) return 1;
     if (!is_valid_name(package_name)) {
-        fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n", package_name);
+        fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n",
+                package_name);
         return 1;
     }
 
-    printf("[Dreams] Shedding (uninstalling) package: %s\n", package_name);
+    if (opts->dry_run) {
+        printf("[Dreams] Dry run: would shed package: %s\n", package_name);
+    } else {
+        printf("[Dreams] Shedding (uninstalling) package: %s\n", package_name);
+    }
 
     home = get_real_home(NULL, NULL);
     if (!home) {
@@ -1360,9 +2607,9 @@ int cmd_shed(const char *package_name) {
         return 1;
     }
 
-    /* Resolve the install root once so containment checks are consistent. */
     if (!realpath(local_dir, resolved_local)) {
-        if (path_join(resolved_local, sizeof resolved_local, home, ".local") != 0) {
+        if (path_join(resolved_local, sizeof resolved_local, home,
+                      ".local") != 0) {
             fprintf(stderr, "[Dreams] Error: path is too long.\n");
             free(home);
             return 1;
@@ -1402,6 +2649,11 @@ int cmd_shed(const char *package_name) {
             return 1;
         }
         if (lstat(fallback, &st) == 0) {
+            if (opts->dry_run) {
+                printf("[Dreams] Dry run: would remove %s\n", fallback);
+                free(home);
+                return 0;
+            }
             printf("[Dreams] No manifest found, but found binary at %s. Removing...\n",
                    fallback);
             if (resolve_for_delete(fallback, resolved_fallback,
@@ -1432,30 +2684,54 @@ int cmd_shed(const char *package_name) {
         return 1;
     }
 
+    fclose(f);
+
     if (!realpath(local_dir, resolved_local)) {
-        if (path_join(resolved_local, sizeof resolved_local, home, ".local") != 0) {
+        if (path_join(resolved_local, sizeof resolved_local, home,
+                      ".local") != 0) {
             fprintf(stderr, "[Dreams] Error: path is too long.\n");
-            fclose(f);
             free(home);
             return 1;
         }
     }
 
-    while (fgets(line, sizeof line, f)) {
+    memset(&files, 0, sizeof files);
+    manifest_read(&files, &meta, &unsafe, manifest_path, resolved_local, NULL);
+    if (unsafe > 0) {
+        fprintf(stderr,
+                "[Dreams] Error: manifest contains %zu unsafe entr%s; refusing to continue.\n",
+                unsafe, unsafe == 1 ? "y" : "ies");
+        strlist_free(&files);
+        free(home);
+        return 1;
+    }
+
+    if (opts->dry_run) {
+        for (i = 0; i < files.len; i++) {
+            printf("[Dreams] Would remove file: %s\n", files.items[i]);
+        }
+        if (failures == 0) {
+            printf("[Dreams] Dry run: would remove %zu file(s) and manifest %s\n",
+                   files.len, manifest_path);
+        }
+        strlist_free(&files);
+        free(home);
+        return failures > 0 ? 1 : 0;
+    }
+
+    for (i = 0; i < files.len; i++) {
         char resolved[PATH_MAX];
 
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0]) continue;
-
-        if (resolve_for_delete(line, resolved, sizeof resolved) != 0) {
+        if (resolve_for_delete(files.items[i], resolved,
+                               sizeof resolved) != 0) {
             fprintf(stderr, "[Dreams] Warning: tracked file no longer exists: %s\n",
-                    line);
+                    files.items[i]);
             continue;
         }
         if (!is_within(resolved, resolved_local)) {
             fprintf(stderr,
                     "[Dreams] Error: refusing to delete outside %s: %s\n",
-                    resolved_local, line);
+                    resolved_local, files.items[i]);
             failures++;
             continue;
         }
@@ -1473,7 +2749,7 @@ int cmd_shed(const char *package_name) {
             remove_empty_parents(resolved, resolved_local);
         }
     }
-    fclose(f);
+    strlist_free(&files);
 
     if (failures == 0) {
         if (remove(manifest_path) != 0) {
@@ -1500,95 +2776,695 @@ int cmd_shed(const char *package_name) {
 /* List command                                                              */
 /* ------------------------------------------------------------------------- */
 
-int cmd_list(void) {
+int cmd_list(const illus_options *opts) {
     char *home = get_real_home(NULL, NULL);
+    char local_dir[PATH_MAX];
     char manifest_dir[PATH_MAX];
-    DIR *dir;
-    struct dirent *entry;
-    int count = 0;
+    char bin_dir[PATH_MAX];
+    package_info *pkgs = NULL;
+    strlist untracked;
+    size_t count = 0;
+    size_t i;
+    int verify_failed = 0;
+    int color = use_color();
+    int first_json = 1;
 
+    memset(&untracked, 0, sizeof untracked);
     if (!home) {
         fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
         return 1;
     }
-    if (path_join(manifest_dir, sizeof manifest_dir, home,
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0 ||
+        path_join(manifest_dir, sizeof manifest_dir, home,
+                  ".local/share/illus") != 0 ||
+        path_join(bin_dir, sizeof bin_dir, home, ".local/bin") != 0) {
+        fprintf(stderr, "[Dreams] Error: path is too long.\n");
+        free(home);
+        return 1;
+    }
+
+    if (collect_packages(manifest_dir, local_dir, &pkgs, &count) != 0) {
+        free(home);
+        return 1;
+    }
+    if (opts->all && collect_untracked(pkgs, count, bin_dir, &untracked) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not read ~/.local/bin.\n");
+        free(pkgs);
+        free(home);
+        return 1;
+    }
+
+    if (opts->json) {
+        printf("[");
+        for (i = 0; i < count; i++) {
+            if (!first_json) printf(",");
+            first_json = 0;
+            printf("{\"name\":");
+            json_string(stdout, pkgs[i].name);
+            printf(",\"tracked\":true,\"files\":%zu,\"missing\":%zu,"
+                   "\"unsafe\":%zu,\"bytes\":%llu",
+                   pkgs[i].file_count, pkgs[i].missing, pkgs[i].unsafe,
+                   pkgs[i].bytes);
+            if (opts->verbose) {
+                printf(",\"manifest\":");
+                json_string(stdout, pkgs[i].manifest);
+                if (pkgs[i].meta.source[0]) {
+                    printf(",\"source\":");
+                    json_string(stdout, pkgs[i].meta.source);
+                }
+                if (pkgs[i].meta.branch[0]) {
+                    printf(",\"branch\":");
+                    json_string(stdout, pkgs[i].meta.branch);
+                }
+                if (pkgs[i].meta.installed[0]) {
+                    printf(",\"installed\":");
+                    json_string(stdout, pkgs[i].meta.installed);
+                }
+            }
+            printf("}");
+        }
+        for (i = 0; i < untracked.len; i++) {
+            if (!first_json) printf(",");
+            first_json = 0;
+            printf("{\"name\":");
+            json_string(stdout, untracked.items[i]);
+            printf(",\"tracked\":false}");
+        }
+        printf("]\n");
+    } else {
+        printf("\n");
+        if (color) {
+            printf("\033[36m=== Tracked packages ===\033[0m\n");
+        } else {
+            printf("=== Tracked packages ===\n");
+        }
+        if (count == 0) {
+            printf("  (none)\n");
+        } else {
+            printf("  %-24s %6s %10s  %s\n", "PACKAGE", "FILES", "SIZE",
+                   "STATUS");
+            for (i = 0; i < count; i++) {
+                char sizebuf[32];
+
+                format_size(pkgs[i].bytes, sizebuf, sizeof sizebuf);
+                printf("  %-24s %6zu %10s  ", pkgs[i].name,
+                       pkgs[i].file_count, sizebuf);
+                if (pkgs[i].unsafe > 0) {
+                    if (color) printf("\033[31m");
+                    printf("%zu unsafe", pkgs[i].unsafe);
+                    if (color) printf("\033[0m");
+                } else if (pkgs[i].missing > 0) {
+                    if (color) printf("\033[33m");
+                    printf("%zu missing", pkgs[i].missing);
+                    if (color) printf("\033[0m");
+                } else {
+                    if (color) printf("\033[32m");
+                    printf("ok");
+                    if (color) printf("\033[0m");
+                }
+                printf("\n");
+                if (opts->verbose) {
+                    printf("      manifest: %s\n", pkgs[i].manifest);
+                    if (pkgs[i].meta.source[0]) {
+                        printf("      source: %s\n", pkgs[i].meta.source);
+                    }
+                    if (pkgs[i].meta.branch[0]) {
+                        printf("      branch: %s\n", pkgs[i].meta.branch);
+                    }
+                    if (pkgs[i].meta.installed[0]) {
+                        printf("      installed: %s\n",
+                               pkgs[i].meta.installed);
+                    }
+                }
+            }
+        }
+
+        if (opts->all) {
+            printf("\n");
+            if (color) {
+                printf("\033[36m=== Untracked binaries in ~/.local/bin ===\033[0m\n");
+            } else {
+                printf("=== Untracked binaries in ~/.local/bin ===\n");
+            }
+            if (untracked.len == 0) {
+                printf("  (none)\n");
+            } else {
+                for (i = 0; i < untracked.len; i++) {
+                    printf("  %s (untracked)\n", untracked.items[i]);
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    if (opts->verify) {
+        for (i = 0; i < count; i++) {
+            if (pkgs[i].missing > 0 || pkgs[i].unsafe > 0) {
+                verify_failed = 1;
+            }
+        }
+        if (verify_failed) {
+            fprintf(stderr,
+                    "[Dreams] Verification failed: some tracked files are "
+                    "missing or unsafe.\n");
+        }
+    }
+
+    free(pkgs);
+    strlist_free(&untracked);
+    free(home);
+    return verify_failed ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Info command                                                              */
+/* ------------------------------------------------------------------------- */
+
+int cmd_info(const illus_options *opts, const char *name) {
+    char *home;
+    char local_dir[PATH_MAX];
+    char manifest_dir[PATH_MAX];
+    char direct[PATH_MAX];
+    char manifest[PATH_MAX] = "";
+    char pkg_name[256];
+    strlist files;
+    manifest_meta meta;
+    size_t unsafe = 0;
+    size_t missing = 0;
+    unsigned long long bytes = 0;
+    size_t i;
+    int found = 0;
+    int via_binary = 0;
+    registry_entry entry;
+
+    if (!is_valid_name(name)) {
+        fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n", name);
+        return 1;
+    }
+
+    home = get_real_home(NULL, NULL);
+    if (!home) {
+        fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
+        return 1;
+    }
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0 ||
+        path_join(manifest_dir, sizeof manifest_dir, home,
                   ".local/share/illus") != 0) {
         fprintf(stderr, "[Dreams] Error: path is too long.\n");
         free(home);
         return 1;
     }
 
-    dir = opendir(manifest_dir);
-    if (dir) {
-        while ((entry = readdir(dir)) != NULL) {
-            size_t len = strlen(entry->d_name);
-            char name[256];
-
-            if (len < 5 || strcmp(entry->d_name + len - 4, ".txt") != 0) continue;
-            if (len - 4 >= sizeof name) continue;
-            memcpy(name, entry->d_name, len - 4);
-            name[len - 4] = '\0';
-
-            if (count == 0) {
-                printf("\n\033[36m=== Tracked packages ===\033[0m\n");
-            }
-            printf("  ✦ \033[35m%s\033[0m\n", name);
-            count++;
+    {
+        char filename[PATH_MAX];
+        if (make_filename(filename, sizeof filename, name, ".txt") == 0 &&
+            path_join(direct, sizeof direct, manifest_dir, filename) == 0 &&
+            access(direct, R_OK) == 0) {
+            strcpy(manifest, direct);
+            found = 1;
         }
-        closedir(dir);
     }
-
-    if (count == 0) {
-        char bin_dir[PATH_MAX];
-        DIR *bin_dir_handle;
-
-        printf("\n[Dreams] No tracked packages found.\n");
-        if (path_join(bin_dir, sizeof bin_dir, home, ".local/bin") == 0 &&
-            (bin_dir_handle = opendir(bin_dir)) != NULL) {
-            printf("\n\033[36m=== Binaries in ~/.local/bin ===\033[0m\n");
-            while ((entry = readdir(bin_dir_handle)) != NULL) {
-                if (entry->d_name[0] == '.') continue;
-                printf("  ✦ \033[35m%s\033[0m\n", entry->d_name);
-                count++;
-            }
-            closedir(bin_dir_handle);
+    if (!found) {
+        int matches = find_manifest_for_binary(manifest_dir, name, manifest,
+                                               sizeof manifest);
+        if (matches == -2) {
+            fprintf(stderr,
+                    "[Dreams] Error: multiple packages provide '%s'; use the package name.\n",
+                    name);
+            free(home);
+            return 1;
         }
-        if (count == 0) {
-            printf("  (none)\n");
+        if (matches == 1) {
+            found = 1;
+            via_binary = 1;
         }
     }
 
-    printf("\n");
+    if (!found) {
+        int rc = registry_lookup(opts, home, name, &entry);
+
+        if (rc == 0) {
+            if (opts->json) {
+                printf("{\"name\":");
+                json_string(stdout, entry.name);
+                printf(",\"installed\":false,\"url\":");
+                json_string(stdout, entry.url);
+                if (entry.branch[0]) {
+                    printf(",\"branch\":");
+                    json_string(stdout, entry.branch);
+                }
+                if (entry.description[0]) {
+                    printf(",\"description\":");
+                    json_string(stdout, entry.description);
+                }
+                printf("}\n");
+            } else {
+                printf("\nPackage: %s\n", entry.name);
+                printf("Status: not installed (available in registry)\n");
+                printf("URL: %s\n", entry.url);
+                if (entry.branch[0]) printf("Branch: %s\n", entry.branch);
+                if (entry.description[0]) {
+                    printf("Description: %s\n", entry.description);
+                }
+                printf("\nInstall with: illus install %s\n\n", entry.name);
+            }
+            free(home);
+            return 0;
+        }
+        if (rc < 0) {
+            free(home);
+            return 1;
+        }
+        fprintf(stderr,
+                "[Dreams] Error: package '%s' is not installed and was not found in the registry.\n",
+                name);
+        free(home);
+        return 1;
+    }
+
+    if (via_binary) {
+        manifest_package_name(manifest, pkg_name, sizeof pkg_name);
+    } else {
+        copy_field(pkg_name, sizeof pkg_name, name);
+    }
+
+    memset(&files, 0, sizeof files);
+    if (manifest_read(&files, &meta, &unsafe, manifest, local_dir, NULL) != 0) {
+        perror("[Dreams] Error: could not read manifest");
+        free(home);
+        return 1;
+    }
+    for (i = 0; i < files.len; i++) {
+        struct stat st;
+        if (lstat(files.items[i], &st) != 0) {
+            missing++;
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            bytes += (unsigned long long)st.st_size;
+        }
+    }
+
+    if (opts->json) {
+        printf("{\"name\":");
+        json_string(stdout, pkg_name);
+        printf(",\"installed\":true,\"manifest\":");
+        json_string(stdout, manifest);
+        printf(",\"files\":%zu,\"missing\":%zu,\"unsafe\":%zu,"
+               "\"bytes\":%llu",
+               files.len, missing, unsafe, bytes);
+        if (meta.source[0]) {
+            printf(",\"source\":");
+            json_string(stdout, meta.source);
+        }
+        if (meta.branch[0]) {
+            printf(",\"branch\":");
+            json_string(stdout, meta.branch);
+        }
+        if (meta.installed[0]) {
+            printf(",\"installed_at\":");
+            json_string(stdout, meta.installed);
+        }
+        if (opts->files) {
+            printf(",\"paths\":[");
+            for (i = 0; i < files.len; i++) {
+                struct stat st;
+                int exists = (lstat(files.items[i], &st) == 0);
+
+                if (i > 0) printf(",");
+                printf("{\"path\":");
+                json_string(stdout, files.items[i]);
+                printf(",\"exists\":%s}", exists ? "true" : "false");
+            }
+            printf("]");
+        }
+        printf("}\n");
+    } else {
+        char sizebuf[32];
+
+        format_size(bytes, sizebuf, sizeof sizebuf);
+        printf("\nPackage: %s\n", pkg_name);
+        printf("Status: installed\n");
+        printf("Manifest: %s\n", manifest);
+        if (meta.source[0]) printf("Source: %s\n", meta.source);
+        if (meta.branch[0]) printf("Branch: %s\n", meta.branch);
+        if (meta.installed[0]) printf("Installed: %s\n", meta.installed);
+        printf("Files: %zu\n", files.len);
+        printf("Size: %s\n", sizebuf);
+        printf("Missing: %zu\n", missing);
+        printf("Unsafe entries: %zu\n", unsafe);
+        if (opts->files) {
+            printf("\nFiles:\n");
+            for (i = 0; i < files.len; i++) {
+                struct stat st;
+                if (lstat(files.items[i], &st) != 0) {
+                    printf("  %s (missing)\n", files.items[i]);
+                } else {
+                    printf("  %s\n", files.items[i]);
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    strlist_free(&files);
     free(home);
     return 0;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Help                                                                      */
+/* Search command                                                            */
 /* ------------------------------------------------------------------------- */
 
-void print_help(const char *program_name) {
-    printf("\033[36m");
-    printf("  ___ _ _            \n");
-    printf(" |_ _| | |_   _ ___  \n");
-    printf("  | || | | | | / __| \n");
-    printf("  | || | | |_| \\__ \\ \n");
-    printf(" |___|_|_|\\__,_|___/ \n\n");
-    printf("\033[0m");
-    printf(" ✦ Dreams Package Manager (illus) v%s ✦\n\n", ILLUS_VERSION);
-    printf("Usage:\n");
-    printf("  %s --pull <url> [--dir <path>] [--force]\n", program_name);
-    printf("      Clone a repository into ~/Dreams or an explicit destination.\n");
-    printf("  %s --cast [--store] [--fresh]\n", program_name);
-    printf("      Build the current project; --store installs into ~/.local.\n");
-    printf("  %s --shed <package>\n", program_name);
-    printf("      Uninstall a package; accepts its package or binary name.\n");
-    printf("  %s --update\n", program_name);
-    printf("      Pull, rebuild and reinstall every project in ~/Dreams.\n");
-    printf("  %s --list\n", program_name);
-    printf("      List tracked packages (or ~/.local/bin binaries).\n");
-    printf("  %s --version\n", program_name);
-    printf("      Show version information.\n");
-    printf("  %s --help\n", program_name);
-    printf("      Show this help.\n");
+int cmd_search(const illus_options *opts, const char *term) {
+    char *home;
+    FILE *f;
+    char line[2048];
+    registry_entry entry;
+    int found = 0;
+    int first_json = 1;
+
+    home = get_real_home(NULL, NULL);
+    if (!home) {
+        fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
+        return 1;
+    }
+    f = registry_open(opts, home);
+    if (!f) {
+        free(home);
+        return 1;
+    }
+
+    if (opts->json) {
+        printf("[");
+    } else {
+        if (term && *term) {
+            printf("\nSearch results for '%s':\n", term);
+        } else {
+            printf("\nRegistry packages:\n");
+        }
+        if (opts->verbose) {
+            printf("  %-24s %-12s %-40s %s\n", "NAME", "BRANCH", "URL",
+                   "DESCRIPTION");
+        } else {
+            printf("  %-24s %-12s %s\n", "NAME", "BRANCH", "DESCRIPTION");
+        }
+    }
+
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        if (parse_registry_line(line, &entry) != 0) continue;
+        if (term && *term &&
+            !contains_ci(entry.name, term) &&
+            !contains_ci(entry.description, term) &&
+            !contains_ci(entry.url, term)) {
+            continue;
+        }
+        found++;
+        if (opts->json) {
+            if (!first_json) printf(",");
+            first_json = 0;
+            printf("{\"name\":");
+            json_string(stdout, entry.name);
+            printf(",\"url\":");
+            json_string(stdout, entry.url);
+            if (entry.branch[0]) {
+                printf(",\"branch\":");
+                json_string(stdout, entry.branch);
+            }
+            if (entry.description[0]) {
+                printf(",\"description\":");
+                json_string(stdout, entry.description);
+            }
+            printf("}");
+        } else {
+            if (opts->verbose) {
+                printf("  %-24s %-12s %-40s %s\n", entry.name,
+                       entry.branch[0] ? entry.branch : "-", entry.url,
+                       entry.description);
+            } else {
+                printf("  %-24s %-12s %s\n", entry.name,
+                       entry.branch[0] ? entry.branch : "-",
+                       entry.description);
+            }
+        }
+    }
+    fclose(f);
+
+    if (opts->json) {
+        printf("]\n");
+    } else {
+        if (found == 0) printf("  (no matches)\n");
+        printf("\n");
+    }
+    free(home);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Doctor command                                                            */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    int failures;
+    int warnings;
+    int json;
+    int first;
+} doctor_state;
+
+static void doctor_emit(doctor_state *state, const char *status,
+                        const char *check, const char *detail) {
+    if (state->json) {
+        if (!state->first) printf(",");
+        state->first = 0;
+        printf("{\"check\":");
+        json_string(stdout, check);
+        printf(",\"status\":");
+        json_string(stdout, status);
+        if (detail && *detail) {
+            printf(",\"detail\":");
+            json_string(stdout, detail);
+        }
+        printf("}");
+    } else {
+        if (strcmp(status, "pass") == 0) {
+            printf("  [ OK ] %s", check);
+        } else if (strcmp(status, "warn") == 0) {
+            printf("  [WARN] %s", check);
+        } else {
+            printf("  [FAIL] %s", check);
+        }
+        if (detail && *detail) printf(": %s", detail);
+        printf("\n");
+    }
+    if (strcmp(status, "fail") == 0) state->failures++;
+    if (strcmp(status, "warn") == 0) state->warnings++;
+}
+
+int cmd_doctor(const illus_options *opts) {
+    doctor_state state;
+    char *home = NULL;
+    char local_dir[PATH_MAX];
+    char bin_dir[PATH_MAX];
+    char manifest_dir[PATH_MAX];
+    char buf[PATH_MAX];
+    struct stat st;
+
+    memset(&state, 0, sizeof state);
+    state.json = opts->json;
+    state.first = 1;
+    if (opts->json) {
+        printf("[");
+    } else {
+        printf("\nDreams Package Manager (illus) doctor\n\n");
+    }
+
+    home = get_real_home(NULL, NULL);
+    if (!home) {
+        doctor_emit(&state, "fail", "home directory", "could not resolve");
+        goto done;
+    }
+    doctor_emit(&state, "pass", "home directory", home);
+
+    if (geteuid() == 0) {
+        if (env_truthy("ILLUS_ALLOW_ROOT")) {
+            doctor_emit(&state, "warn", "running as root",
+                        "ILLUS_ALLOW_ROOT is set");
+        } else {
+            doctor_emit(&state, "fail", "running as root",
+                        "package operations will be refused");
+        }
+    } else {
+        doctor_emit(&state, "pass", "not running as root", "");
+    }
+
+    if (path_join(local_dir, sizeof local_dir, home, ".local") != 0 ||
+        path_join(bin_dir, sizeof bin_dir, home, ".local/bin") != 0 ||
+        path_join(manifest_dir, sizeof manifest_dir, home,
+                  ".local/share/illus") != 0) {
+        doctor_emit(&state, "fail", "paths", "path is too long");
+        goto done;
+    }
+    if (opts->verbose) {
+        char detail[PATH_MAX * 3 + 64];
+
+        snprintf(detail, sizeof detail, "local=%s bin=%s manifests=%s",
+                 local_dir, bin_dir, manifest_dir);
+        doctor_emit(&state, "pass", "paths", detail);
+    }
+
+    if (stat(local_dir, &st) != 0) {
+        doctor_emit(&state, "warn", "~/.local",
+                    "missing (created on first install)");
+    } else if (!S_ISDIR(st.st_mode)) {
+        doctor_emit(&state, "fail", "~/.local", "not a directory");
+    } else {
+        if (st.st_uid != getuid()) {
+            doctor_emit(&state, "fail", "~/.local ownership",
+                        "not owned by you");
+        } else {
+            doctor_emit(&state, "pass", "~/.local ownership", "");
+        }
+        if (st.st_mode & S_IWOTH) {
+            doctor_emit(&state, "fail", "~/.local permissions",
+                        "world-writable");
+        } else {
+            doctor_emit(&state, "pass", "~/.local permissions", "");
+        }
+    }
+
+    if (dir_on_path(bin_dir)) {
+        doctor_emit(&state, "pass", "~/.local/bin on PATH", "");
+    } else {
+        doctor_emit(&state, "warn", "~/.local/bin on PATH", "add it to PATH");
+    }
+
+    {
+        const char *tools[] = {"git", "make", "cmake", NULL};
+        size_t i;
+
+        for (i = 0; tools[i] != NULL; i++) {
+            char found[PATH_MAX];
+            char check[64];
+
+            snprintf(check, sizeof check, "%s available", tools[i]);
+            if (find_in_path(tools[i], found, sizeof found) == 0) {
+                doctor_emit(&state, "pass", check, found);
+            } else {
+                doctor_emit(&state, "warn", check, "not found");
+            }
+        }
+    }
+
+    {
+        DIR *d = opendir(manifest_dir);
+
+        if (!d) {
+            if (errno == ENOENT) {
+                doctor_emit(&state, "warn", "manifest directory",
+                            "missing (no packages installed)");
+            } else {
+                doctor_emit(&state, "fail", "manifest directory",
+                            strerror(errno));
+            }
+        } else {
+            package_info *pkgs = NULL;
+            size_t count = 0;
+
+            closedir(d);
+            if (collect_packages(manifest_dir, local_dir, &pkgs, &count) != 0) {
+                doctor_emit(&state, "fail", "manifest directory",
+                            "could not read manifests");
+            } else {
+                size_t i;
+                size_t missing = 0;
+                size_t unsafe = 0;
+
+                snprintf(buf, sizeof buf, "%zu package(s)", count);
+                doctor_emit(&state, "pass", "manifests", buf);
+                for (i = 0; i < count; i++) {
+                    missing += pkgs[i].missing;
+                    unsafe += pkgs[i].unsafe;
+                }
+                if (missing > 0) {
+                    snprintf(buf, sizeof buf, "%zu missing file(s)", missing);
+                    doctor_emit(&state, "warn", "tracked files", buf);
+                } else {
+                    doctor_emit(&state, "pass", "tracked files", "");
+                }
+                if (unsafe > 0) {
+                    snprintf(buf, sizeof buf, "%zu unsafe entr%s", unsafe,
+                             unsafe == 1 ? "y" : "ies");
+                    doctor_emit(&state, "fail", "manifest safety", buf);
+                } else {
+                    doctor_emit(&state, "pass", "manifest safety", "");
+                }
+                free(pkgs);
+            }
+        }
+    }
+
+    {
+        DIR *d = opendir(local_dir);
+        int stale = 0;
+
+        if (d) {
+            struct dirent *entry;
+            while ((entry = readdir(d)) != NULL) {
+                if (strncmp(entry->d_name, ".illus-stage-", 13) == 0) stale++;
+            }
+            closedir(d);
+        }
+        if (stale > 0) {
+            snprintf(buf, sizeof buf, "%d stale staging director%s", stale,
+                     stale == 1 ? "y" : "ies");
+            doctor_emit(&state, "warn", "staging directories", buf);
+        } else {
+            doctor_emit(&state, "pass", "staging directories", "");
+        }
+    }
+
+    {
+        package_info *pkgs = NULL;
+        size_t count = 0;
+        strlist untracked;
+
+        memset(&untracked, 0, sizeof untracked);
+        collect_packages(manifest_dir, local_dir, &pkgs, &count);
+        collect_untracked(pkgs, count, bin_dir, &untracked);
+        free(pkgs);
+        if (untracked.len > 0) {
+            snprintf(buf, sizeof buf, "%zu untracked binar%s", untracked.len,
+                     untracked.len == 1 ? "y" : "ies");
+            doctor_emit(&state, "warn", "untracked binaries", buf);
+        } else {
+            doctor_emit(&state, "pass", "untracked binaries", "");
+        }
+        strlist_free(&untracked);
+    }
+
+    {
+        const char *source = registry_source(opts);
+        struct stat rst;
+
+        if (stat(source, &rst) == 0) {
+            doctor_emit(&state, "pass", "registry", source);
+        } else if (looks_like_url(source)) {
+            doctor_emit(&state, "pass", "registry",
+                        "remote (cached on demand)");
+        } else {
+            doctor_emit(&state, "warn", "registry", "not found");
+        }
+    }
+
+done:
+    if (opts->json) {
+        printf("]\n");
+    } else {
+        printf("\n%d failure(s), %d warning(s)\n\n", state.failures,
+               state.warnings);
+    }
+    free(home);
+    return state.failures > 0 ? 1 : 0;
 }

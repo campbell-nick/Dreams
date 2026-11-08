@@ -1,6 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wformat-security -std=c99 -O2
 TARGET = illus
+SOURCES = main.c cli.c commands.c
+HEADERS = cli.h commands.h
 
 ifeq ($(shell id -u), 0)
     PREFIX ?= /usr/local
@@ -10,8 +12,11 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): main.c commands.c commands.h
-	$(CC) $(CFLAGS) main.c commands.c -o $(TARGET)
+$(TARGET): $(SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET)
+
+check: $(TARGET)
+	sh tests/integration.sh ./$(TARGET)
 
 install: $(TARGET)
 	@test -n "$(PREFIX)" || { echo "install: PREFIX must not be empty" >&2; exit 1; }
@@ -27,4 +32,4 @@ uninstall:
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all install uninstall clean
+.PHONY: all check install uninstall clean

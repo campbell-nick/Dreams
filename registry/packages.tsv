@@ -1,0 +1,14 @@
+# Dreams package registry
+#
+# Format (tab-separated):
+#   name<TAB>url<TAB>branch<TAB>description
+#
+# - name:        lowercase package name used by `illus install <name>`
+# - url:         any URL or local path accepted by `git clone`
+# - branch:      optional branch, tag, or commit (empty means the default)
+# - description: optional human-readable text used by `illus search`
+#
+# Lines starting with '#' and blank lines are ignored. Override this registry
+# with `--registry <path|url>` or ILLUS_REGISTRY.
+
+dreams	https://github.com/campbell-nick/Dreams.git		The Dreams package manager (illus) itself
