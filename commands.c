@@ -1565,12 +1565,23 @@ static int git_clone(const illus_options *opts, const char *url,
     int n = 0;
 
     if (cgc_preferred(url, opts)) {
-        char *cargv[4];
+        char *cargv[8];
+        char depth_buf[32];
+        int n = 0;
 
-        cargv[0] = "cgc";
-        cargv[1] = (char *)url;
-        cargv[2] = (char *)target;
-        cargv[3] = NULL;
+        cargv[n++] = "cgc";
+        if (opts->branch && *opts->branch) {
+            cargv[n++] = "-b";
+            cargv[n++] = (char *)opts->branch;
+        }
+        if (opts->depth > 0) {
+            cargv[n++] = "--depth";
+            snprintf(depth_buf, sizeof depth_buf, "%d", opts->depth);
+            cargv[n++] = depth_buf;
+        }
+        cargv[n++] = (char *)url;
+        cargv[n++] = (char *)target;
+        cargv[n] = NULL;
         return run_cmd(cargv);
     }
 
