@@ -27,6 +27,8 @@
 #define MANIFEST_HEADER      "# illus-manifest-v2"
 #define REGISTRY_FILE        "packages.tsv"
 #define REGISTRY_SUBDIR      "registry"
+#define REGISTRY_RECIPE_DIR  "packages"
+#define REGISTRY_RECIPE_EXT  ".conf"
 #define DEFAULT_REGISTRY_URL "https://github.com/campbell-nick/Dreams.git"
 #define REGISTRY_MAX_AGE     86400
 
@@ -77,6 +79,147 @@ static int run_cmd_with_destdir(char *const argv[], const char *destdir) {
     } else {
         unsetenv("DESTDIR");
     }
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Argument lists                                                            */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char **items;
+    size_t len;
+    size_t cap;
+} arglist;
+
+static int arglist_add(arglist *l, const char *s) {
+    char *dup;
+    char **grown;
+
+    if (l->len == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 8;
+
+        grown = realloc(l->items, ncap * sizeof(*grown));
+        if (!grown) return -1;
+        l->items = grown;
+        l->cap = ncap;
+    }
+    dup = strdup(s);
+    if (!dup) return -1;
+    l->items[l->len++] = dup;
+    return 0;
+}
+
+static void arglist_free(arglist *l) {
+    size_t i;
+
+    for (i = 0; i < l->len; i++) free(l->items[i]);
+    free(l->items);
+    l->items = NULL;
+    l->len = 0;
+    l->cap = 0;
+}
+
+/*
+ * Split a recipe argument string into words. This deliberately supports only
+ * quoting and backslash escaping: no shell expansion, command substitution, or
+ * globbing ever reaches the build.
+ */
+static int split_args(const char *text, arglist *out) {
+    char token[PATH_MAX];
+    size_t len = 0;
+    int quote = 0;
+    const char *p = text;
+
+    if (!text) return 0;
+    for (;; p++) {
+        char c = *p;
+
+        if (c == '\0') {
+            if (quote) return -1;
+            if (len > 0) {
+                token[len] = '\0';
+                if (arglist_add(out, token) != 0) return -1;
+                len = 0;
+            }
+            return 0;
+        }
+        if (quote == 0 && isspace((unsigned char)c)) {
+            if (len > 0) {
+                token[len] = '\0';
+                if (arglist_add(out, token) != 0) return -1;
+                len = 0;
+            }
+            continue;
+        }
+        if (c == '\\' && quote != '\'') {
+            p++;
+            if (*p == '\0') return -1;
+            c = *p;
+        } else if (c == '\'' || c == '"') {
+            if (quote == 0) {
+                quote = c;
+                continue;
+            }
+            if (quote == c) {
+                quote = 0;
+                continue;
+            }
+        }
+        if (len + 1 >= sizeof token) return -1;
+        token[len++] = c;
+    }
+}
+
+static char **argv_with_extra(char *const base[], const char *extra,
+                              arglist *args) {
+    size_t nbase = 0;
+    size_t i;
+    char **argv;
+
+    while (base[nbase] != NULL) nbase++;
+    if (split_args(extra, args) != 0) return NULL;
+    argv = calloc(nbase + args->len + 1, sizeof(*argv));
+    if (!argv) return NULL;
+    for (i = 0; i < nbase; i++) argv[i] = base[i];
+    for (i = 0; i < args->len; i++) argv[nbase + i] = args->items[i];
+    return argv;
+}
+
+static int run_cmd_extra(char *const base[], const char *extra) {
+    arglist args;
+    char **argv;
+    int rc;
+
+    memset(&args, 0, sizeof args);
+    argv = argv_with_extra(base, extra, &args);
+    if (!argv) {
+        arglist_free(&args);
+        fprintf(stderr, "[Dreams] Error: could not parse build arguments.\n");
+        return -1;
+    }
+    rc = run_cmd(argv);
+    free(argv);
+    arglist_free(&args);
+    return rc;
+}
+
+static int run_cmd_with_destdir_extra(char *const base[], const char *extra,
+                                      const char *destdir) {
+    arglist args;
+    char **argv;
+    int rc;
+
+    memset(&args, 0, sizeof args);
+    argv = argv_with_extra(base, extra, &args);
+    if (!argv) {
+        arglist_free(&args);
+        fprintf(stderr, "[Dreams] Error: could not parse build arguments.\n");
+        return -1;
+    }
+    rc = run_cmd_with_destdir(argv, destdir);
+    free(argv);
+    arglist_free(&args);
     return rc;
 }
 
@@ -544,6 +687,232 @@ static int dir_on_path(const char *dir) {
     return 0;
 }
 
+static int tool_available(const char *name) {
+    char path[PATH_MAX];
+
+    return find_in_path(name, path, sizeof path) == 0;
+}
+
+/* Run a command and capture its standard output. */
+static int run_cmd_capture(char *const argv[], char *out, size_t out_size) {
+    int fds[2];
+    pid_t pid;
+    int status;
+    size_t used = 0;
+
+    if (!out || out_size == 0) return -1;
+    out[0] = '\0';
+    if (pipe(fds) != 0) {
+        perror("[Dreams] Error: pipe failed");
+        return -1;
+    }
+    fflush(NULL);
+    pid = fork();
+    if (pid < 0) {
+        perror("[Dreams] Error: fork failed");
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
+        close(fds[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    for (;;) {
+        char buf[512];
+        ssize_t n = read(fds[0], buf, sizeof buf);
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        if (used + (size_t)n < out_size) {
+            memcpy(out + used, buf, (size_t)n);
+            used += (size_t)n;
+        }
+    }
+    close(fds[0]);
+    out[used] = '\0';
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int hex_digest(const char *text, char *out, size_t out_size) {
+    const char *p;
+    size_t n = 0;
+
+    if (out_size < 65) return -1;
+    for (p = text; *p; p++) {
+        if (!isxdigit((unsigned char)*p)) continue;
+        out[n++] = *p;
+        if (n == 64) {
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Compute a SHA-256 digest with whichever tool the platform provides. */
+static int sha256_file(const char *path, char *out, size_t out_size) {
+    char buf[1024];
+    char *sum_argv[] = {"sha256sum", (char *)path, NULL};
+    char *shasum_argv[] = {"shasum", "-a", "256", (char *)path, NULL};
+    char *openssl_argv[] = {"openssl", "dgst", "-sha256", (char *)path, NULL};
+
+    if (tool_available("sha256sum") &&
+        run_cmd_capture(sum_argv, buf, sizeof buf) == 0 &&
+        hex_digest(buf, out, out_size) == 0) {
+        return 0;
+    }
+    if (tool_available("shasum") &&
+        run_cmd_capture(shasum_argv, buf, sizeof buf) == 0 &&
+        hex_digest(buf, out, out_size) == 0) {
+        return 0;
+    }
+    if (tool_available("openssl") &&
+        run_cmd_capture(openssl_argv, buf, sizeof buf) == 0 &&
+        hex_digest(buf, out, out_size) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in;
+    FILE *out;
+    char buf[8192];
+    size_t n;
+    int rc = 0;
+
+    in = fopen(src, "rb");
+    if (!in) {
+        perror("[Dreams] Error: could not open source file");
+        return -1;
+    }
+    out = fopen(dst, "wb");
+    if (!out) {
+        perror("[Dreams] Error: could not create destination file");
+        fclose(in);
+        return -1;
+    }
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            perror("[Dreams] Error: could not write destination file");
+            rc = -1;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        perror("[Dreams] Error: could not read source file");
+        rc = -1;
+    }
+    if (fclose(out) != 0) rc = -1;
+    fclose(in);
+    if (rc != 0) unlink(dst);
+    return rc;
+}
+
+static int download_file(const char *url, const char *dest) {
+    const char *local = url;
+
+    if (strncmp(local, "file://", 7) == 0) local += 7;
+    if (strstr(local, "://") == NULL && access(local, R_OK) == 0) {
+        return copy_file(local, dest);
+    }
+    if (tool_available("curl")) {
+        char *argv[] = {
+            "curl", "-fL", "--retry", "3", "-o", (char *)dest, "--",
+            (char *)url, NULL
+        };
+        return run_cmd(argv) == 0 ? 0 : -1;
+    }
+    if (tool_available("wget")) {
+        char *argv[] = {
+            "wget", "-q", "-O", (char *)dest, "--", (char *)url, NULL
+        };
+        return run_cmd(argv) == 0 ? 0 : -1;
+    }
+    fprintf(stderr,
+            "[Dreams] Error: neither curl nor wget is available to download tarballs.\n");
+    return -1;
+}
+
+static int has_suffix(const char *text, const char *suffix) {
+    size_t a = strlen(text);
+    size_t b = strlen(suffix);
+
+    return a >= b && strcmp(text + a - b, suffix) == 0;
+}
+
+static int url_is_tarball(const char *url) {
+    static const char *exts[] = {
+        ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
+        ".tar.zst", ".tzst", ".tar", ".zip", NULL
+    };
+    size_t len;
+    size_t i;
+
+    if (!url) return 0;
+    len = strlen(url);
+    {
+        const char *query = strchr(url, '?');
+        if (query) len = (size_t)(query - url);
+    }
+    for (i = 0; exts[i] != NULL; i++) {
+        size_t elen = strlen(exts[i]);
+        if (len >= elen && strncmp(url + len - elen, exts[i], elen) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static size_t strip_archive_suffix(char *name, size_t len) {
+    static const char *exts[] = {
+        ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
+        ".tar.zst", ".tzst", ".tar", ".zip", NULL
+    };
+    size_t i;
+
+    for (i = 0; exts[i] != NULL; i++) {
+        size_t elen = strlen(exts[i]);
+        if (len >= elen && strcmp(name + len - elen, exts[i]) == 0) {
+            name[len - elen] = '\0';
+            return len - elen;
+        }
+    }
+    return len;
+}
+
+static int extract_archive(const char *archive, const char *dest) {
+    if (has_suffix(archive, ".zip")) {
+        char *argv[] = {
+            "unzip", "-q", (char *)archive, "-d", (char *)dest, NULL
+        };
+        if (!tool_available("unzip")) {
+            fprintf(stderr, "[Dreams] Error: unzip is required for .zip sources.\n");
+            return -1;
+        }
+        return run_cmd(argv) == 0 ? 0 : -1;
+    }
+    if (!tool_available("tar")) {
+        fprintf(stderr, "[Dreams] Error: tar is required for tarball sources.\n");
+        return -1;
+    }
+    {
+        char *argv[] = {
+            "tar", "-xf", (char *)archive, "-C", (char *)dest, NULL
+        };
+        return run_cmd(argv) == 0 ? 0 : -1;
+    }
+}
+
 static void format_size(unsigned long long bytes, char *out, size_t size) {
     static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
     double value = (double)bytes;
@@ -628,7 +997,9 @@ static int derive_repo_name(const char *url, char *out, size_t out_size) {
     out[name_len] = '\0';
     if (name_len > 4 && strcmp(out + name_len - 4, ".git") == 0) {
         out[name_len - 4] = '\0';
+        name_len -= 4;
     }
+    strip_archive_suffix(out, name_len);
     return is_valid_name(out) ? 0 : -1;
 }
 
@@ -1218,15 +1589,57 @@ static int git_update_ref(const char *dir, const char *ref) {
     return git_pull_ff(dir);
 }
 
+/* Move a prepared directory into place, replacing an existing one on request. */
+static int swap_dir_into_place(const char *src, const char *target, int force,
+                               const char *home, uid_t uid, gid_t gid) {
+    char parent[PATH_MAX];
+    char backup[PATH_MAX];
+    struct stat st;
+
+    if (parent_dir(target, parent, sizeof parent) != 0) return -1;
+    if (lstat(target, &st) == 0) {
+        if (!force) {
+            fprintf(stderr, "[Dreams] Error: destination already exists: %s\n",
+                    target);
+            fprintf(stderr, "[Dreams] Use --force to replace it.\n");
+            return -1;
+        }
+        if (path_join(backup, sizeof backup, parent, ".illus-old-XXXXXX") != 0 ||
+            !mkdtemp(backup)) {
+            perror("[Dreams] Error: could not create backup directory");
+            return -1;
+        }
+        if (rmdir(backup) != 0) {
+            /* best effort */
+        }
+        if (rename(target, backup) != 0) {
+            perror("[Dreams] Error: could not move existing destination aside");
+            return -1;
+        }
+        if (rename(src, target) != 0) {
+            perror("[Dreams] Error: could not move new directory into place");
+            rename(backup, target);
+            return -1;
+        }
+        remove_path(backup);
+    } else if (rename(src, target) != 0) {
+        perror("[Dreams] Error: could not move directory into place");
+        return -1;
+    }
+
+    if (getuid() == 0) {
+        recursive_chown(target, uid, gid);
+        chown_with_parents(target, home, uid, gid);
+    }
+    return 0;
+}
+
 /* Clone into a temporary sibling, then swap it into place atomically. */
 static int clone_atomic(const illus_options *opts, const char *url,
                         const char *target, int force, const char *home,
                         uid_t uid, gid_t gid) {
     char parent[PATH_MAX];
     char tmp[PATH_MAX];
-    char backup[PATH_MAX];
-    struct stat st;
-    int exists;
 
     if (parent_dir(target, parent, sizeof parent) != 0) return -1;
     if (path_join(tmp, sizeof tmp, parent, ".illus-clone-XXXXXX") != 0) return -1;
@@ -1242,46 +1655,125 @@ static int clone_atomic(const illus_options *opts, const char *url,
         return -1;
     }
 
-    exists = (lstat(target, &st) == 0);
-    if (exists) {
-        if (!force) {
-            remove_directory(tmp);
-            fprintf(stderr, "[Dreams] Error: destination already exists: %s\n",
-                    target);
-            fprintf(stderr, "[Dreams] Use --force to replace it.\n");
-            return -1;
+    if (swap_dir_into_place(tmp, target, force, home, uid, gid) != 0) {
+        remove_directory(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static int hex_equal(const char *a, const char *b) {
+    size_t i;
+
+    for (i = 0; i < 64; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) {
+            return 0;
         }
-        if (path_join(backup, sizeof backup, parent, ".illus-old-XXXXXX") != 0 ||
-            !mkdtemp(backup)) {
-            remove_directory(tmp);
-            perror("[Dreams] Error: could not create backup directory");
-            return -1;
-        }
-        if (rmdir(backup) != 0) {
-            /* best effort */
-        }
-        if (rename(target, backup) != 0) {
-            perror("[Dreams] Error: could not move existing destination aside");
-            remove_directory(tmp);
-            return -1;
-        }
-        if (rename(tmp, target) != 0) {
-            perror("[Dreams] Error: could not move new clone into place");
-            rename(backup, target);
-            remove_directory(tmp);
-            return -1;
-        }
-        remove_path(backup);
-    } else if (rename(tmp, target) != 0) {
-        perror("[Dreams] Error: could not move clone into place");
+    }
+    return 1;
+}
+
+/* Download, verify, extract, and atomically place a tarball source. */
+static int fetch_tarball_atomic(const char *url, const char *sha256,
+                                const char *target, int force,
+                                const char *home, uid_t uid, gid_t gid) {
+    char parent[PATH_MAX];
+    char tmp[PATH_MAX];
+    char archive[PATH_MAX];
+    char extract[PATH_MAX];
+    char actual[PATH_MAX];
+    char single[256] = "";
+    char digest[65];
+    DIR *d;
+    struct dirent *p;
+    int entries = 0;
+    int only_dir = 1;
+    struct stat st;
+
+    if (parent_dir(target, parent, sizeof parent) != 0) return -1;
+    if (path_join(tmp, sizeof tmp, parent, ".illus-clone-XXXXXX") != 0) return -1;
+    if (!mkdtemp(tmp)) {
+        perror("[Dreams] Error: could not create download directory");
+        return -1;
+    }
+    if (path_join(archive, sizeof archive, tmp, "source.archive") != 0 ||
+        path_join(extract, sizeof extract, tmp, "src") != 0) {
         remove_directory(tmp);
         return -1;
     }
 
-    if (getuid() == 0) {
-        recursive_chown(target, uid, gid);
-        chown_with_parents(target, home, uid, gid);
+    printf("[Dreams] Downloading %s...\n", url);
+    if (download_file(url, archive) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not download %s.\n", url);
+        remove_directory(tmp);
+        return -1;
     }
+    if (sha256_file(archive, digest, sizeof digest) != 0) {
+        fprintf(stderr,
+                "[Dreams] Error: no SHA-256 tool found (sha256sum, shasum, or openssl).\n");
+        remove_directory(tmp);
+        return -1;
+    }
+    if (!hex_equal(digest, sha256)) {
+        fprintf(stderr, "[Dreams] Error: SHA-256 mismatch for %s.\n", url);
+        fprintf(stderr, "[Dreams] Expected: %s\n", sha256);
+        fprintf(stderr, "[Dreams] Got:      %s\n", digest);
+        remove_directory(tmp);
+        return -1;
+    }
+
+    if (mkdir(extract, 0755) != 0) {
+        perror("[Dreams] Error: could not create extraction directory");
+        remove_directory(tmp);
+        return -1;
+    }
+    if (extract_archive(archive, extract) != 0) {
+        fprintf(stderr, "[Dreams] Error: could not extract %s.\n", url);
+        remove_directory(tmp);
+        return -1;
+    }
+
+    d = opendir(extract);
+    if (!d) {
+        perror("[Dreams] Error: could not read extracted archive");
+        remove_directory(tmp);
+        return -1;
+    }
+    while ((p = readdir(d)) != NULL) {
+        char candidate[PATH_MAX];
+
+        if (strcmp(p->d_name, ".") == 0 || strcmp(p->d_name, "..") == 0) {
+            continue;
+        }
+        entries++;
+        if (entries == 1) copy_field(single, sizeof single, p->d_name);
+        if (path_join(candidate, sizeof candidate, extract, p->d_name) != 0 ||
+            lstat(candidate, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            only_dir = 0;
+        }
+        if (entries > 1) only_dir = 0;
+    }
+    closedir(d);
+
+    if (entries == 0) {
+        fprintf(stderr, "[Dreams] Error: archive %s was empty.\n", url);
+        remove_directory(tmp);
+        return -1;
+    }
+    if (only_dir && single[0]) {
+        if (path_join(actual, sizeof actual, extract, single) != 0) {
+            remove_directory(tmp);
+            return -1;
+        }
+    } else {
+        copy_field(actual, sizeof actual, extract);
+    }
+
+    if (swap_dir_into_place(actual, target, force, home, uid, gid) != 0) {
+        remove_directory(tmp);
+        return -1;
+    }
+    remove_directory(tmp);
     return 0;
 }
 
@@ -1406,7 +1898,20 @@ typedef struct {
     char url[PATH_MAX];
     char branch[256];
     char description[512];
+    char version[64];
+    char build[32];
+    char source[16];
+    char sha256[65];
+    char depends[512];
+    char configure_args[512];
+    char make_args[512];
+    char homepage[PATH_MAX];
 } registry_entry;
+
+typedef struct {
+    char root[PATH_MAX];
+    int is_file;
+} registry_handle;
 
 static const char *registry_source(const illus_options *opts) {
     const char *env = getenv("ILLUS_REGISTRY");
@@ -1429,17 +1934,17 @@ static int registry_cache_dir(const char *home, char *out, size_t out_size) {
     return path_join(out, out_size, base, "illus/registry");
 }
 
-static int registry_ensure(const illus_options *opts, const char *home,
-                           char *root, size_t root_size, int *is_file) {
+static int registry_resolve(const illus_options *opts, const char *home,
+                            registry_handle *handle) {
     const char *source = registry_source(opts);
     struct stat st;
 
-    *is_file = 0;
+    memset(handle, 0, sizeof *handle);
     if (stat(source, &st) == 0) {
         if (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode)) {
-            if (strlen(source) + 1 > root_size) return -1;
-            strcpy(root, source);
-            *is_file = S_ISREG(st.st_mode) ? 1 : 0;
+            if (strlen(source) + 1 > sizeof handle->root) return -1;
+            strcpy(handle->root, source);
+            handle->is_file = S_ISREG(st.st_mode) ? 1 : 0;
             return 0;
         }
         fprintf(stderr,
@@ -1451,7 +1956,7 @@ static int registry_ensure(const illus_options *opts, const char *home,
         fprintf(stderr, "[Dreams] Error: registry not found: %s\n", source);
         return -1;
     }
-    if (registry_cache_dir(home, root, root_size) != 0) {
+    if (registry_cache_dir(home, handle->root, sizeof handle->root) != 0) {
         fprintf(stderr, "[Dreams] Error: registry cache path is too long.\n");
         return -1;
     }
@@ -1461,7 +1966,9 @@ static int registry_ensure(const illus_options *opts, const char *home,
         struct stat cache_st;
         int need_update = opts->refresh;
 
-        if (path_join(git_dir, sizeof git_dir, root, ".git") != 0) return -1;
+        if (path_join(git_dir, sizeof git_dir, handle->root, ".git") != 0) {
+            return -1;
+        }
         if (stat(git_dir, &cache_st) != 0) {
             char parent[PATH_MAX];
             char *argv[8];
@@ -1473,18 +1980,18 @@ static int registry_ensure(const illus_options *opts, const char *home,
              * directory without .git. It cannot be reused, and git clone
              * refuses a non-empty destination, so remove it first.
              */
-            if (lstat(root, &root_st) == 0) {
+            if (lstat(handle->root, &root_st) == 0) {
                 if (S_ISLNK(root_st.st_mode) || !S_ISDIR(root_st.st_mode)) {
-                    if (unlink(root) != 0) {
+                    if (unlink(handle->root) != 0) {
                         perror("[Dreams] Error: could not clear registry cache");
                         return -1;
                     }
                 } else {
-                    remove_directory(root);
+                    remove_directory(handle->root);
                 }
             }
 
-            if (parent_dir(root, parent, sizeof parent) != 0) return -1;
+            if (parent_dir(handle->root, parent, sizeof parent) != 0) return -1;
             if (mkdir_p(parent, 0755) != 0) {
                 perror("[Dreams] Error: could not create registry cache");
                 return -1;
@@ -1496,21 +2003,21 @@ static int registry_ensure(const illus_options *opts, const char *home,
             argv[n++] = "1";
             argv[n++] = "--";
             argv[n++] = (char *)source;
-            argv[n++] = (char *)root;
+            argv[n++] = handle->root;
             argv[n] = NULL;
             if (run_cmd(argv) != 0) {
                 fprintf(stderr, "[Dreams] Error: could not fetch registry.\n");
-                remove_directory(root);
+                remove_directory(handle->root);
                 return -1;
             }
         } else {
-            if (!need_update && stat(root, &cache_st) == 0) {
+            if (!need_update && stat(handle->root, &cache_st) == 0) {
                 time_t now = time(NULL);
                 if (now - cache_st.st_mtime > REGISTRY_MAX_AGE) need_update = 1;
             }
             if (need_update) {
                 printf("[Dreams] Refreshing package registry...\n");
-                if (git_pull_ff(root) != 0) {
+                if (git_pull_ff(handle->root) != 0) {
                     fprintf(stderr,
                             "[Dreams] Warning: could not refresh registry; using cached copy.\n");
                 }
@@ -1520,51 +2027,143 @@ static int registry_ensure(const illus_options *opts, const char *home,
     return 0;
 }
 
-static int registry_file(const char *root, int is_file, char *out,
-                         size_t out_size) {
+static int registry_tsv_path(const registry_handle *handle, char *out,
+                             size_t out_size) {
     char candidate[PATH_MAX];
 
-    if (is_file) {
-        if (strlen(root) + 1 > out_size) return -1;
-        strcpy(out, root);
+    if (handle->is_file) {
+        if (strlen(handle->root) + 1 > out_size) return -1;
+        strcpy(out, handle->root);
         return 0;
     }
-    if (path_join(candidate, sizeof candidate, root,
+    if (path_join(candidate, sizeof candidate, handle->root,
                   REGISTRY_SUBDIR "/" REGISTRY_FILE) == 0 &&
         access(candidate, R_OK) == 0) {
         if (strlen(candidate) + 1 > out_size) return -1;
         strcpy(out, candidate);
         return 0;
     }
-    if (path_join(candidate, sizeof candidate, root, REGISTRY_FILE) == 0 &&
+    if (path_join(candidate, sizeof candidate, handle->root, REGISTRY_FILE) == 0 &&
         access(candidate, R_OK) == 0) {
         if (strlen(candidate) + 1 > out_size) return -1;
         strcpy(out, candidate);
         return 0;
     }
-    fprintf(stderr, "[Dreams] Error: registry file not found under %s\n", root);
     return -1;
 }
 
-static FILE *registry_open(const illus_options *opts, const char *home) {
-    char root[PATH_MAX];
-    char file[PATH_MAX];
-    int is_file = 0;
-    FILE *f;
+static int registry_recipe_dir(const registry_handle *handle, char *out,
+                               size_t out_size) {
+    char candidate[PATH_MAX];
+    struct stat st;
 
-    if (registry_ensure(opts, home, root, sizeof root, &is_file) != 0) return NULL;
-    if (registry_file(root, is_file, file, sizeof file) != 0) return NULL;
-    f = fopen(file, "r");
-    if (!f) perror("[Dreams] Error: could not open registry");
-    return f;
+    if (handle->is_file) return -1;
+    if (path_join(candidate, sizeof candidate, handle->root,
+                  REGISTRY_SUBDIR "/" REGISTRY_RECIPE_DIR) == 0 &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (strlen(candidate) + 1 > out_size) return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
+    if (path_join(candidate, sizeof candidate, handle->root,
+                  REGISTRY_RECIPE_DIR) == 0 &&
+        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (strlen(candidate) + 1 > out_size) return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
+    return -1;
+}
+
+static int registry_recipe_path(const registry_handle *handle, const char *name,
+                                char *out, size_t out_size) {
+    char dir[PATH_MAX];
+    char filename[256];
+
+    if (registry_recipe_dir(handle, dir, sizeof dir) != 0) return -1;
+    if (make_filename(filename, sizeof filename, name, REGISTRY_RECIPE_EXT) != 0) {
+        return -1;
+    }
+    if (path_join(out, out_size, dir, filename) != 0) return -1;
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static char *trim_ws(char *s) {
+    char *end;
+
+    while (*s && isspace((unsigned char)*s)) s++;
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+    return s;
+}
+
+static int registry_finalize(registry_entry *entry, const char *origin) {
+    if (!is_valid_name(entry->name)) {
+        if (origin) {
+            fprintf(stderr, "[Dreams] Error: %s: invalid package name '%s'.\n",
+                    origin, entry->name);
+        }
+        return -1;
+    }
+    if (validate_repo_url(entry->url) != 0) {
+        if (origin) {
+            fprintf(stderr, "[Dreams] Error: %s: invalid or missing url.\n", origin);
+        }
+        return -1;
+    }
+    if (entry->build[0] && strcmp(entry->build, "auto") != 0 &&
+        strcmp(entry->build, "make") != 0 &&
+        strcmp(entry->build, "cmake") != 0 &&
+        strcmp(entry->build, "autotools") != 0) {
+        if (origin) {
+            fprintf(stderr, "[Dreams] Error: %s: unknown build system '%s'.\n",
+                    origin, entry->build);
+        }
+        return -1;
+    }
+    if (entry->source[0] && strcmp(entry->source, "git") != 0 &&
+        strcmp(entry->source, "tarball") != 0) {
+        if (origin) {
+            fprintf(stderr, "[Dreams] Error: %s: unknown source type '%s'.\n",
+                    origin, entry->source);
+        }
+        return -1;
+    }
+    if (!entry->source[0]) {
+        copy_field(entry->source, sizeof entry->source,
+                   url_is_tarball(entry->url) ? "tarball" : "git");
+    }
+    if (strcmp(entry->source, "tarball") == 0) {
+        size_t i;
+
+        if (strlen(entry->sha256) != 64) {
+            if (origin) {
+                fprintf(stderr,
+                        "[Dreams] Error: %s: tarball sources require a 64-character sha256.\n",
+                        origin);
+            }
+            return -1;
+        }
+        for (i = 0; i < 64; i++) {
+            if (!isxdigit((unsigned char)entry->sha256[i])) {
+                if (origin) {
+                    fprintf(stderr, "[Dreams] Error: %s: sha256 is not hexadecimal.\n",
+                            origin);
+                }
+                return -1;
+            }
+        }
+    }
+    return 0;
 }
 
 static int parse_registry_line(char *line, registry_entry *entry) {
-    char *fields[4];
+    char *fields[8];
     int n = 0;
     char *p = line;
 
-    while (n < 4) {
+    while (n < 8) {
         char *tab = strchr(p, '\t');
         fields[n++] = p;
         if (!tab) break;
@@ -1572,39 +2171,250 @@ static int parse_registry_line(char *line, registry_entry *entry) {
         p = tab + 1;
     }
     if (n < 2) return -1;
-    if (!is_valid_name(fields[0])) return -1;
-    if (validate_repo_url(fields[1]) != 0) return -1;
-
     memset(entry, 0, sizeof *entry);
     copy_field(entry->name, sizeof entry->name, fields[0]);
     copy_field(entry->url, sizeof entry->url, fields[1]);
     if (n > 2) copy_field(entry->branch, sizeof entry->branch, fields[2]);
     if (n > 3) copy_field(entry->description, sizeof entry->description, fields[3]);
+    if (n > 4) copy_field(entry->build, sizeof entry->build, fields[4]);
+    if (n > 5) copy_field(entry->source, sizeof entry->source, fields[5]);
+    if (n > 6) copy_field(entry->sha256, sizeof entry->sha256, fields[6]);
+    if (n > 7) copy_field(entry->version, sizeof entry->version, fields[7]);
+    return registry_finalize(entry, NULL);
+}
+
+static int parse_recipe_file(const char *path, registry_entry *entry) {
+    FILE *f;
+    char line[4096];
+    char stem[256];
+    const char *base;
+    size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
+
+    memset(entry, 0, sizeof *entry);
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    copy_field(stem, sizeof stem, base);
+    if (strlen(stem) > ext_len &&
+        strcmp(stem + strlen(stem) - ext_len, REGISTRY_RECIPE_EXT) == 0) {
+        stem[strlen(stem) - ext_len] = '\0';
+    }
+    copy_field(entry->name, sizeof entry->name, stem);
+
+    f = fopen(path, "r");
+    if (!f) {
+        perror("[Dreams] Error: could not open recipe");
+        return -1;
+    }
+    while (fgets(line, sizeof line, f)) {
+        char *eq;
+        char *key;
+        char *value;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        key = trim_ws(line);
+        if (!*key || *key == '#') continue;
+        eq = strchr(key, '=');
+        if (!eq) {
+            fprintf(stderr, "[Dreams] Error: %s: expected key=value.\n", path);
+            fclose(f);
+            return -1;
+        }
+        *eq = '\0';
+        value = trim_ws(eq + 1);
+        key = trim_ws(key);
+
+        if (strcmp(key, "name") == 0) {
+            copy_field(entry->name, sizeof entry->name, value);
+        } else if (strcmp(key, "url") == 0) {
+            copy_field(entry->url, sizeof entry->url, value);
+        } else if (strcmp(key, "branch") == 0) {
+            copy_field(entry->branch, sizeof entry->branch, value);
+        } else if (strcmp(key, "description") == 0) {
+            copy_field(entry->description, sizeof entry->description, value);
+        } else if (strcmp(key, "version") == 0) {
+            copy_field(entry->version, sizeof entry->version, value);
+        } else if (strcmp(key, "build") == 0) {
+            copy_field(entry->build, sizeof entry->build, value);
+        } else if (strcmp(key, "source") == 0) {
+            copy_field(entry->source, sizeof entry->source, value);
+        } else if (strcmp(key, "sha256") == 0) {
+            copy_field(entry->sha256, sizeof entry->sha256, value);
+        } else if (strcmp(key, "depends") == 0) {
+            copy_field(entry->depends, sizeof entry->depends, value);
+        } else if (strcmp(key, "configure_args") == 0) {
+            copy_field(entry->configure_args, sizeof entry->configure_args, value);
+        } else if (strcmp(key, "make_args") == 0) {
+            copy_field(entry->make_args, sizeof entry->make_args, value);
+        } else if (strcmp(key, "homepage") == 0) {
+            copy_field(entry->homepage, sizeof entry->homepage, value);
+        }
+        /* Unknown keys are ignored so taps can grow without breaking old clients. */
+    }
+    fclose(f);
+    return registry_finalize(entry, path);
+}
+
+static int registry_scan_recipes(const registry_handle *handle, const char *name,
+                                 registry_entry *out, int *found) {
+    char dir[PATH_MAX];
+    DIR *d;
+    struct dirent *p;
+    size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
+
+    *found = 0;
+    if (registry_recipe_dir(handle, dir, sizeof dir) != 0) return -1;
+    d = opendir(dir);
+    if (!d) return -1;
+    while ((p = readdir(d)) != NULL) {
+        char path[PATH_MAX];
+        registry_entry entry;
+        size_t len = strlen(p->d_name);
+
+        if (len <= ext_len ||
+            strcmp(p->d_name + len - ext_len, REGISTRY_RECIPE_EXT) != 0) {
+            continue;
+        }
+        if (path_join(path, sizeof path, dir, p->d_name) != 0) continue;
+        if (parse_recipe_file(path, &entry) != 0) continue;
+        if (strcmp(entry.name, name) == 0) {
+            *out = entry;
+            *found = 1;
+            break;
+        }
+    }
+    closedir(d);
     return 0;
 }
 
 /* Returns 0 when found, 1 when absent, -1 on registry errors. */
 static int registry_lookup(const illus_options *opts, const char *home,
                            const char *name, registry_entry *out) {
-    FILE *f = registry_open(opts, home);
-    char line[2048];
+    registry_handle handle;
+    char path[PATH_MAX];
+    char line[4096];
+    FILE *f;
     int found = 0;
 
-    if (!f) return -1;
-    while (fgets(line, sizeof line, f)) {
-        registry_entry entry;
+    if (registry_resolve(opts, home, &handle) != 0) return -1;
 
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0] || line[0] == '#') continue;
-        if (parse_registry_line(line, &entry) != 0) continue;
-        if (strcmp(entry.name, name) == 0) {
-            *out = entry;
-            found = 1;
-            break;
+    if (!handle.is_file &&
+        registry_recipe_path(&handle, name, path, sizeof path) == 0) {
+        if (parse_recipe_file(path, out) != 0) return -1;
+        return 0;
+    }
+
+    if (registry_tsv_path(&handle, path, sizeof path) == 0) {
+        f = fopen(path, "r");
+        if (!f) {
+            perror("[Dreams] Error: could not open registry");
+            return -1;
+        }
+        while (fgets(line, sizeof line, f)) {
+            registry_entry entry;
+
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0] || line[0] == '#') continue;
+            if (parse_registry_line(line, &entry) != 0) continue;
+            if (strcmp(entry.name, name) == 0) {
+                *out = entry;
+                found = 1;
+                break;
+            }
+        }
+        fclose(f);
+        return found ? 0 : 1;
+    }
+
+    if (!handle.is_file) {
+        if (registry_scan_recipes(&handle, name, out, &found) == 0 && found) {
+            return 0;
+        }
+        if (registry_recipe_dir(&handle, path, sizeof path) == 0) return 1;
+    }
+    fprintf(stderr, "[Dreams] Error: registry file not found under %s\n",
+            handle.root);
+    return -1;
+}
+
+typedef int (*registry_visit_fn)(const registry_entry *entry, void *ctx);
+
+static int registry_foreach(const illus_options *opts, const char *home,
+                            registry_visit_fn visit, void *ctx) {
+    registry_handle handle;
+    char path[PATH_MAX];
+    char line[4096];
+    FILE *f;
+    int have_tsv = 0;
+    int have_recipes = 0;
+
+    if (registry_resolve(opts, home, &handle) != 0) return -1;
+
+    if (registry_tsv_path(&handle, path, sizeof path) == 0) {
+        have_tsv = 1;
+        f = fopen(path, "r");
+        if (!f) {
+            perror("[Dreams] Error: could not open registry");
+            return -1;
+        }
+        while (fgets(line, sizeof line, f)) {
+            registry_entry entry;
+            char recipe[PATH_MAX];
+
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0] || line[0] == '#') continue;
+            if (parse_registry_line(line, &entry) != 0) continue;
+            /* A recipe with the same name overrides the legacy TSV row. */
+            if (!handle.is_file &&
+                registry_recipe_path(&handle, entry.name, recipe,
+                                     sizeof recipe) == 0) {
+                continue;
+            }
+            if (visit(&entry, ctx) != 0) {
+                fclose(f);
+                return -1;
+            }
+        }
+        fclose(f);
+    }
+
+    if (!handle.is_file) {
+        char dir[PATH_MAX];
+        DIR *d;
+        struct dirent *p;
+        size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
+
+        if (registry_recipe_dir(&handle, dir, sizeof dir) == 0) {
+            have_recipes = 1;
+            d = opendir(dir);
+            if (!d) {
+                perror("[Dreams] Error: could not open recipe directory");
+                return -1;
+            }
+            while ((p = readdir(d)) != NULL) {
+                registry_entry entry;
+                size_t len = strlen(p->d_name);
+
+                if (len <= ext_len ||
+                    strcmp(p->d_name + len - ext_len, REGISTRY_RECIPE_EXT) != 0) {
+                    continue;
+                }
+                if (path_join(path, sizeof path, dir, p->d_name) != 0) continue;
+                if (parse_recipe_file(path, &entry) != 0) continue;
+                if (visit(&entry, ctx) != 0) {
+                    closedir(d);
+                    return -1;
+                }
+            }
+            closedir(d);
         }
     }
-    fclose(f);
-    return found ? 0 : 1;
+
+    if (!have_tsv && !have_recipes) {
+        fprintf(stderr, "[Dreams] Error: registry file not found under %s\n",
+                handle.root);
+        return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1883,6 +2693,11 @@ int cmd_cast(const illus_options *opts) {
     char stage[PATH_MAX];
     char cmake_path[PATH_MAX];
     char makefile_path[PATH_MAX];
+    char configure_path[PATH_MAX];
+    char configure_ac_path[PATH_MAX];
+    char configure_in_path[PATH_MAX];
+    char makefile_am_path[PATH_MAX];
+    char makefile_in_path[PATH_MAX];
     char build_dir[PATH_MAX];
     char pkg_name[256];
     char jobs_buf[32];
@@ -1891,6 +2706,8 @@ int cmd_cast(const illus_options *opts) {
     int can_track;
     int is_cmake;
     int is_makefile;
+    int is_autotools;
+    int has_configure;
     int rc = 0;
     manifest_meta meta;
 
@@ -1912,6 +2729,16 @@ int cmd_cast(const illus_options *opts) {
                   "CMakeLists.txt") != 0 ||
         path_join(makefile_path, sizeof makefile_path, workspace,
                   "Makefile") != 0 ||
+        path_join(configure_path, sizeof configure_path, workspace,
+                  "configure") != 0 ||
+        path_join(configure_ac_path, sizeof configure_ac_path, workspace,
+                  "configure.ac") != 0 ||
+        path_join(configure_in_path, sizeof configure_in_path, workspace,
+                  "configure.in") != 0 ||
+        path_join(makefile_am_path, sizeof makefile_am_path, workspace,
+                  "Makefile.am") != 0 ||
+        path_join(makefile_in_path, sizeof makefile_in_path, workspace,
+                  "Makefile.in") != 0 ||
         path_join(build_dir, sizeof build_dir, workspace, "build") != 0) {
         fprintf(stderr, "[Dreams] Error: path is too long.\n");
         free(home);
@@ -1920,18 +2747,37 @@ int cmd_cast(const illus_options *opts) {
 
     is_cmake = (access(cmake_path, F_OK) == 0);
     is_makefile = (access(makefile_path, F_OK) == 0);
+    has_configure = (access(configure_path, F_OK) == 0);
+    is_autotools = has_configure ||
+        ((access(configure_ac_path, F_OK) == 0 ||
+          access(configure_in_path, F_OK) == 0) &&
+         (access(makefile_am_path, F_OK) == 0 ||
+          access(makefile_in_path, F_OK) == 0));
 
-    if (opts->build_system && *opts->build_system) {
+    if (opts->build_system && *opts->build_system &&
+        strcmp(opts->build_system, "auto") != 0) {
         if (strcmp(opts->build_system, "cmake") == 0) {
             is_makefile = 0;
+            is_autotools = 0;
             if (!is_cmake) {
                 fprintf(stderr,
                         "[Dreams] Error: --build-system=cmake but no CMakeLists.txt found.\n");
                 free(home);
                 return 1;
             }
+        } else if (strcmp(opts->build_system, "autotools") == 0) {
+            is_cmake = 0;
+            is_makefile = 0;
+            if (!is_autotools) {
+                fprintf(stderr,
+                        "[Dreams] Error: --build-system=autotools but no configure or "
+                        "configure.ac found.\n");
+                free(home);
+                return 1;
+            }
         } else if (strcmp(opts->build_system, "make") == 0) {
             is_cmake = 0;
+            is_autotools = 0;
             if (!is_makefile) {
                 fprintf(stderr,
                         "[Dreams] Error: --build-system=make but no Makefile found.\n");
@@ -1940,13 +2786,19 @@ int cmd_cast(const illus_options *opts) {
             }
         } else {
             fprintf(stderr,
-                    "[Dreams] Error: --build-system must be 'make' or 'cmake'.\n");
+                    "[Dreams] Error: --build-system must be 'auto', 'make', 'cmake', "
+                    "or 'autotools'.\n");
             free(home);
             return 1;
         }
+    } else if (is_cmake) {
+        /* CMake wins when a project ships both CMake and Autotools files. */
+        is_autotools = 0;
+    } else if (is_autotools) {
+        is_makefile = 0;
     }
 
-    if (!is_cmake && !is_makefile) {
+    if (!is_cmake && !is_autotools && !is_makefile) {
         fprintf(stderr,
                 "[Dreams] Error: No recognized build system found in current directory.\n");
         free(home);
@@ -2017,7 +2869,12 @@ int cmd_cast(const illus_options *opts) {
                 perror("[Dreams] Warning: could not remove build path");
             }
         }
-        if (is_makefile) {
+        if (is_autotools && access(makefile_path, F_OK) == 0) {
+            char *const distclean_argv[] = {"make", "distclean", NULL};
+            if (run_cmd(distclean_argv) != 0) {
+                fprintf(stderr, "[Dreams] Warning: 'make distclean' failed.\n");
+            }
+        } else if (is_makefile) {
             char *const clean_argv[] = {"make", "clean", NULL};
             if (run_cmd(clean_argv) != 0) {
                 fprintf(stderr, "[Dreams] Warning: 'make clean' failed.\n");
@@ -2108,18 +2965,129 @@ int cmd_cast(const illus_options *opts) {
                 return 1;
             }
         }
-    } else {
-        printf("[Dreams] Detected Make build system.\n");
+    } else if (is_autotools) {
+        char prefix_arg[PATH_MAX];
+        const char *opt = "--prefix=";
+        size_t opt_len = strlen(opt);
+        size_t dir_len = strlen(local_dir);
+
+        printf("[Dreams] Detected Autotools build system.\n");
+        if (!has_configure) {
+            char *const autoreconf_argv[] = {"autoreconf", "-fi", NULL};
+
+            if (!tool_available("autoreconf")) {
+                fprintf(stderr,
+                        "[Dreams] Error: configure is missing and autoreconf is not installed.\n");
+                fprintf(stderr,
+                        "[Dreams] Install autoconf, automake, and libtool, or use a "
+                        "release tarball that ships configure.\n");
+                free(home);
+                return 1;
+            }
+            printf("[Dreams] Bootstrapping configure with autoreconf...\n");
+            if (run_cmd(autoreconf_argv) != 0) {
+                fprintf(stderr, "[Dreams] Error: autoreconf failed.\n");
+                free(home);
+                return 1;
+            }
+        }
+        if (opt_len + dir_len + 1 > sizeof prefix_arg) {
+            fprintf(stderr, "[Dreams] Error: install prefix is too long.\n");
+            free(home);
+            return 1;
+        }
+        memcpy(prefix_arg, opt, opt_len);
+        memcpy(prefix_arg + opt_len, local_dir, dir_len + 1);
+
+        {
+            char *const config_argv[] = {"./configure", prefix_arg, NULL};
+            if (run_cmd_extra(config_argv, opts->configure_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: Autotools configuration failed.\n");
+                free(home);
+                return 1;
+            }
+        }
         if (opts->jobs > 0) {
             char *const make_argv[] = {"make", "-j", jobs_buf, NULL};
-            if (run_cmd(make_argv) != 0) {
+            if (run_cmd_extra(make_argv, opts->make_args) != 0) {
                 fprintf(stderr, "[Dreams] Error: build failed.\n");
                 free(home);
                 return 1;
             }
         } else {
             char *const make_argv[] = {"make", NULL};
-            if (run_cmd(make_argv) != 0) {
+            if (run_cmd_extra(make_argv, opts->make_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        }
+        if (opts->store) {
+            char destdir_env[PATH_MAX];
+            const char *dopt = "DESTDIR=";
+            size_t dopt_len = strlen(dopt);
+            size_t stage_len;
+            char *install_argv[4];
+
+            if (make_stage_dir(home, stage, sizeof stage) != 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: could not create staging directory.\n");
+                free(home);
+                return 1;
+            }
+            stage_len = strlen(stage);
+            if (dopt_len + stage_len + 1 > sizeof destdir_env) {
+                fprintf(stderr, "[Dreams] Error: install prefix is too long.\n");
+                remove_directory(stage);
+                free(home);
+                return 1;
+            }
+            memcpy(destdir_env, dopt, dopt_len);
+            memcpy(destdir_env + dopt_len, stage, stage_len + 1);
+
+            install_argv[0] = "make";
+            install_argv[1] = "install";
+            install_argv[2] = destdir_env;
+            install_argv[3] = NULL;
+
+            printf("[Dreams] Storing package into %s (--store)...\n", local_dir);
+            if (run_cmd_with_destdir_extra(install_argv, opts->make_args,
+                                           stage) != 0) {
+                fprintf(stderr, "[Dreams] Error: installation failed.\n");
+                remove_directory(stage);
+                free(home);
+                return 1;
+            }
+            if (can_track) {
+                if (track_install(home, pkg_name, stage, uid, gid, &meta,
+                                  opts->allow_untracked) != 0) {
+                    rc = -1;
+                }
+            } else {
+                fprintf(stderr,
+                        "[Dreams] Warning: installing without a manifest (--allow-untracked).\n");
+                if (track_install(home, NULL, stage, uid, gid, NULL, 1) != 0) {
+                    rc = -1;
+                }
+            }
+            remove_directory(stage);
+            if (rc != 0) {
+                free(home);
+                return 1;
+            }
+        }
+    } else {
+        printf("[Dreams] Detected Make build system.\n");
+        if (opts->jobs > 0) {
+            char *const make_argv[] = {"make", "-j", jobs_buf, NULL};
+            if (run_cmd_extra(make_argv, opts->make_args) != 0) {
+                fprintf(stderr, "[Dreams] Error: build failed.\n");
+                free(home);
+                return 1;
+            }
+        } else {
+            char *const make_argv[] = {"make", NULL};
+            if (run_cmd_extra(make_argv, opts->make_args) != 0) {
                 fprintf(stderr, "[Dreams] Error: build failed.\n");
                 free(home);
                 return 1;
@@ -2163,7 +3131,8 @@ int cmd_cast(const illus_options *opts) {
             install_argv[4] = NULL;
 
             printf("[Dreams] Storing package into %s (--store)...\n", local_dir);
-            if (run_cmd_with_destdir(install_argv, stage) != 0) {
+            if (run_cmd_with_destdir_extra(install_argv, opts->make_args,
+                                           stage) != 0) {
                 fprintf(stderr, "[Dreams] Error: installation failed.\n");
                 remove_directory(stage);
                 free(home);
@@ -2214,6 +3183,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
     char target[PATH_MAX];
     registry_entry entry;
     struct stat st;
+    int is_tarball;
     int rc;
 
     if (refuse_root("install")) return 1;
@@ -2287,13 +3257,92 @@ int cmd_install(const illus_options *opts, const char *spec) {
         return 1;
     }
 
+    is_tarball = (strcmp(entry.source, "tarball") == 0) ||
+                 (entry.source[0] == '\0' && url_is_tarball(url));
+    if (is_tarball) {
+        if (!entry.sha256[0] && opts->sha256 && *opts->sha256) {
+            copy_field(entry.sha256, sizeof entry.sha256, opts->sha256);
+        }
+        if (strlen(entry.sha256) != 64) {
+            fprintf(stderr,
+                    "[Dreams] Error: tarball installs require a 64-character sha256.\n");
+            fprintf(stderr,
+                    "[Dreams] Use a registry recipe or pass --sha256 <hex>.\n");
+            free(home);
+            return 1;
+        }
+        if (branch[0]) {
+            fprintf(stderr,
+                    "[Dreams] Error: --branch is not supported for tarball sources.\n");
+            free(home);
+            return 1;
+        }
+        copy_field(entry.source, sizeof entry.source, "tarball");
+    } else {
+        copy_field(entry.source, sizeof entry.source, "git");
+    }
+    copy_field(entry.name, sizeof entry.name, name);
+    copy_field(entry.url, sizeof entry.url, url);
+    if (!entry.build[0] && opts->build_system && *opts->build_system) {
+        copy_field(entry.build, sizeof entry.build, opts->build_system);
+    }
+    if (!entry.configure_args[0] && opts->configure_args) {
+        copy_field(entry.configure_args, sizeof entry.configure_args,
+                   opts->configure_args);
+    }
+    if (!entry.make_args[0] && opts->make_args) {
+        copy_field(entry.make_args, sizeof entry.make_args, opts->make_args);
+    }
+
     if (resolve_pull_target(opts, home, name, target, sizeof target) != 0) {
         free(home);
         return 1;
     }
 
     if (lstat(target, &st) == 0) {
-        if (opts->force) {
+        if (is_tarball) {
+            char git_dir[PATH_MAX];
+
+            if (!opts->force &&
+                path_join(git_dir, sizeof git_dir, target, ".git") == 0 &&
+                access(git_dir, F_OK) == 0) {
+                fprintf(stderr,
+                        "[Dreams] Error: destination is a git clone, not a tarball source: %s\n",
+                        target);
+                fprintf(stderr, "[Dreams] Use --force to replace it.\n");
+                free(home);
+                return 1;
+            }
+            if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+                char resolved_target[PATH_MAX];
+                char resolved_home[PATH_MAX];
+                const char *safe_home = home;
+
+                if (realpath(home, resolved_home)) safe_home = resolved_home;
+                if (!realpath(target, resolved_target)) {
+                    perror("[Dreams] Error: could not resolve existing destination");
+                    free(home);
+                    return 1;
+                }
+                if (!replace_allowed(resolved_target, safe_home)) {
+                    fprintf(stderr,
+                            "[Dreams] Error: refusing to replace %s\n",
+                            resolved_target);
+                    free(home);
+                    return 1;
+                }
+            }
+            if (opts->dry_run) {
+                printf("[Dreams] Dry run: would refresh %s from %s\n", target, url);
+                free(home);
+                return 0;
+            }
+            if (fetch_tarball_atomic(entry.url, entry.sha256, target, 1, home,
+                                     uid, gid) != 0) {
+                free(home);
+                return 1;
+            }
+        } else if (opts->force) {
             if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
                 char resolved_target[PATH_MAX];
                 char resolved_home[PATH_MAX];
@@ -2355,12 +3404,23 @@ int cmd_install(const illus_options *opts, const char *spec) {
         }
     } else {
         if (opts->dry_run) {
-            printf("[Dreams] Dry run: would clone %s into %s\n", url, target);
+            if (is_tarball) {
+                printf("[Dreams] Dry run: would download and extract %s into %s\n",
+                       url, target);
+            } else {
+                printf("[Dreams] Dry run: would clone %s into %s\n", url, target);
+            }
             printf("[Dreams] Dry run: would build and install package '%s'\n", name);
             free(home);
             return 0;
         }
-        if (clone_atomic(opts, url, target, 0, home, uid, gid) != 0) {
+        if (is_tarball) {
+            if (fetch_tarball_atomic(entry.url, entry.sha256, target, 0, home,
+                                     uid, gid) != 0) {
+                free(home);
+                return 1;
+            }
+        } else if (clone_atomic(opts, url, target, 0, home, uid, gid) != 0) {
             free(home);
             return 1;
         }
@@ -2395,6 +3455,15 @@ int cmd_install(const illus_options *opts, const char *spec) {
         cast_opts.branch = branch[0] ? branch : NULL;
         cast_opts.dir = NULL;
         cast_opts.dry_run = 0;
+        if (entry.build[0] && strcmp(entry.build, "auto") != 0) {
+            cast_opts.build_system = entry.build;
+        }
+        if (entry.configure_args[0]) {
+            cast_opts.configure_args = entry.configure_args;
+        }
+        if (entry.make_args[0]) {
+            cast_opts.make_args = entry.make_args;
+        }
         rc = cmd_cast(&cast_opts);
         if (chdir(cwd) != 0) {
             perror("[Dreams] Warning: could not restore working directory");
@@ -3009,9 +4078,33 @@ int cmd_info(const illus_options *opts, const char *name) {
                 json_string(stdout, entry.name);
                 printf(",\"installed\":false,\"url\":");
                 json_string(stdout, entry.url);
+                if (entry.version[0]) {
+                    printf(",\"version\":");
+                    json_string(stdout, entry.version);
+                }
                 if (entry.branch[0]) {
                     printf(",\"branch\":");
                     json_string(stdout, entry.branch);
+                }
+                if (entry.build[0]) {
+                    printf(",\"build\":");
+                    json_string(stdout, entry.build);
+                }
+                if (entry.source[0]) {
+                    printf(",\"source_type\":");
+                    json_string(stdout, entry.source);
+                }
+                if (entry.sha256[0]) {
+                    printf(",\"sha256\":");
+                    json_string(stdout, entry.sha256);
+                }
+                if (entry.depends[0]) {
+                    printf(",\"depends\":");
+                    json_string(stdout, entry.depends);
+                }
+                if (entry.homepage[0]) {
+                    printf(",\"homepage\":");
+                    json_string(stdout, entry.homepage);
                 }
                 if (entry.description[0]) {
                     printf(",\"description\":");
@@ -3021,8 +4114,14 @@ int cmd_info(const illus_options *opts, const char *name) {
             } else {
                 printf("\nPackage: %s\n", entry.name);
                 printf("Status: not installed (available in registry)\n");
+                if (entry.version[0]) printf("Version: %s\n", entry.version);
+                if (entry.build[0]) printf("Build: %s\n", entry.build);
+                if (entry.source[0]) printf("Source type: %s\n", entry.source);
                 printf("URL: %s\n", entry.url);
                 if (entry.branch[0]) printf("Branch: %s\n", entry.branch);
+                if (entry.homepage[0]) printf("Homepage: %s\n", entry.homepage);
+                if (entry.depends[0]) printf("Depends: %s\n", entry.depends);
+                if (entry.sha256[0]) printf("SHA-256: %s\n", entry.sha256);
                 if (entry.description[0]) {
                     printf("Description: %s\n", entry.description);
                 }
@@ -3136,22 +4235,73 @@ int cmd_info(const illus_options *opts, const char *name) {
 /* Search command                                                            */
 /* ------------------------------------------------------------------------- */
 
+typedef struct {
+    const illus_options *opts;
+    const char *term;
+    int found;
+    int first_json;
+} search_ctx;
+
+static int search_visit(const registry_entry *entry, void *vctx) {
+    search_ctx *ctx = vctx;
+
+    if (ctx->term && *ctx->term &&
+        !contains_ci(entry->name, ctx->term) &&
+        !contains_ci(entry->description, ctx->term) &&
+        !contains_ci(entry->url, ctx->term)) {
+        return 0;
+    }
+    ctx->found++;
+    if (ctx->opts->json) {
+        if (!ctx->first_json) printf(",");
+        ctx->first_json = 0;
+        printf("{\"name\":");
+        json_string(stdout, entry->name);
+        printf(",\"url\":");
+        json_string(stdout, entry->url);
+        if (entry->version[0]) {
+            printf(",\"version\":");
+            json_string(stdout, entry->version);
+        }
+        if (entry->branch[0]) {
+            printf(",\"branch\":");
+            json_string(stdout, entry->branch);
+        }
+        if (entry->build[0]) {
+            printf(",\"build\":");
+            json_string(stdout, entry->build);
+        }
+        if (entry->source[0]) {
+            printf(",\"source_type\":");
+            json_string(stdout, entry->source);
+        }
+        if (entry->description[0]) {
+            printf(",\"description\":");
+            json_string(stdout, entry->description);
+        }
+        printf("}");
+    } else if (ctx->opts->verbose) {
+        printf("  %-24s %-10s %-10s %-40s %s\n", entry->name,
+               entry->version[0] ? entry->version : "-",
+               entry->build[0] ? entry->build : "auto", entry->url,
+               entry->description);
+    } else {
+        const char *detail = entry->version[0] ? entry->version :
+                             (entry->branch[0] ? entry->branch : "-");
+
+        printf("  %-24s %-12s %s\n", entry->name, detail,
+               entry->description);
+    }
+    return 0;
+}
+
 int cmd_search(const illus_options *opts, const char *term) {
     char *home;
-    FILE *f;
-    char line[2048];
-    registry_entry entry;
-    int found = 0;
-    int first_json = 1;
+    search_ctx ctx;
 
     home = get_real_home(NULL, NULL);
     if (!home) {
         fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
-        return 1;
-    }
-    f = registry_open(opts, home);
-    if (!f) {
-        free(home);
         return 1;
     }
 
@@ -3164,58 +4314,26 @@ int cmd_search(const illus_options *opts, const char *term) {
             printf("\nRegistry packages:\n");
         }
         if (opts->verbose) {
-            printf("  %-24s %-12s %-40s %s\n", "NAME", "BRANCH", "URL",
-                   "DESCRIPTION");
+            printf("  %-24s %-10s %-10s %-40s %s\n", "NAME", "VERSION",
+                   "BUILD", "URL", "DESCRIPTION");
         } else {
-            printf("  %-24s %-12s %s\n", "NAME", "BRANCH", "DESCRIPTION");
+            printf("  %-24s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION");
         }
     }
 
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0] || line[0] == '#') continue;
-        if (parse_registry_line(line, &entry) != 0) continue;
-        if (term && *term &&
-            !contains_ci(entry.name, term) &&
-            !contains_ci(entry.description, term) &&
-            !contains_ci(entry.url, term)) {
-            continue;
-        }
-        found++;
-        if (opts->json) {
-            if (!first_json) printf(",");
-            first_json = 0;
-            printf("{\"name\":");
-            json_string(stdout, entry.name);
-            printf(",\"url\":");
-            json_string(stdout, entry.url);
-            if (entry.branch[0]) {
-                printf(",\"branch\":");
-                json_string(stdout, entry.branch);
-            }
-            if (entry.description[0]) {
-                printf(",\"description\":");
-                json_string(stdout, entry.description);
-            }
-            printf("}");
-        } else {
-            if (opts->verbose) {
-                printf("  %-24s %-12s %-40s %s\n", entry.name,
-                       entry.branch[0] ? entry.branch : "-", entry.url,
-                       entry.description);
-            } else {
-                printf("  %-24s %-12s %s\n", entry.name,
-                       entry.branch[0] ? entry.branch : "-",
-                       entry.description);
-            }
-        }
+    memset(&ctx, 0, sizeof ctx);
+    ctx.opts = opts;
+    ctx.term = term;
+    ctx.first_json = 1;
+    if (registry_foreach(opts, home, search_visit, &ctx) != 0) {
+        free(home);
+        return 1;
     }
-    fclose(f);
 
     if (opts->json) {
         printf("]\n");
     } else {
-        if (found == 0) printf("  (no matches)\n");
+        if (ctx.found == 0) printf("  (no matches)\n");
         printf("\n");
     }
     free(home);
@@ -3341,7 +4459,7 @@ int cmd_doctor(const illus_options *opts) {
     }
 
     {
-        const char *tools[] = {"git", "make", "cmake", NULL};
+        const char *tools[] = {"git", "make", "cmake", "autoreconf", "tar", NULL};
         size_t i;
 
         for (i = 0; tools[i] != NULL; i++) {
@@ -3351,6 +4469,12 @@ int cmd_doctor(const illus_options *opts) {
             snprintf(check, sizeof check, "%s available", tools[i]);
             if (find_in_path(tools[i], found, sizeof found) == 0) {
                 doctor_emit(&state, "pass", check, found);
+            } else if (strcmp(tools[i], "cmake") == 0) {
+                doctor_emit(&state, "warn", check, "needed for CMake projects");
+            } else if (strcmp(tools[i], "autoreconf") == 0) {
+                doctor_emit(&state, "warn", check, "needed for Autotools bootstrap");
+            } else if (strcmp(tools[i], "tar") == 0) {
+                doctor_emit(&state, "warn", check, "needed for tarball sources");
             } else {
                 doctor_emit(&state, "warn", check, "not found");
             }

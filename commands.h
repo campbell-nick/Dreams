@@ -1,7 +1,7 @@
 #ifndef COMMANDS_H
 #define COMMANDS_H
 
-#define ILLUS_VERSION "1.1.0"
+#define ILLUS_VERSION "1.2.0"
 
 /*
  * Parsed command-line options. The CLI layer fills this in once and every
@@ -29,6 +29,9 @@ typedef struct {
     const char *registry;
     const char *build_system;
     const char *source;
+    const char *configure_args;
+    const char *make_args;
+    const char *sha256;
 } illus_options;
 
 int cmd_pull(const illus_options *opts, const char *url);

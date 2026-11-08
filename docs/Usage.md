@@ -29,13 +29,13 @@ ILLUS_HOME=/tmp/illus-home illus list
 ## Command overview
 
 ```text
-illus install <name|url>   Clone, build, and install a package
+illus install <name|url>   Fetch, build, and install a package
 illus remove <name>...     Uninstall packages (aliases: shed, uninstall)
 illus list                 List installed packages
 illus info <name>          Show installed or registry details
 illus search [term]        Search the package registry
 illus update               Pull, rebuild, and reinstall ~/Dreams projects
-illus pull <url>           Clone a repository
+illus pull <url>           Clone a git repository
 illus cast                 Build the current project
 illus doctor               Diagnose common problems
 illus version              Show version information
@@ -55,26 +55,37 @@ with status `2` and print the command's usage line.
 illus install <name>
 illus install <url>
 illus install <url> --name <package>
+illus install <tarball-url> --name <package> --sha256 <hex>
 ```
 
-`install` resolves a name through the registry, clones the repository into
+`install` resolves a name through the registry, fetches the source into
 `~/Dreams/<name>` (or `--dir`), then builds and installs it with `DESTDIR`
-staging. If the destination already exists and is a git clone, `install`
-updates it with `git pull --ff-only` and rebuilds; this is the normal upgrade
-path. Use `--reinstall` for a clean rebuild (`--fresh`), or `--force` to
-replace the clone entirely.
+staging.
+
+- **Git sources**: if the destination already exists and is a git clone,
+  `install` updates it (`git pull --ff-only`, or checks out the requested
+  branch/tag) and rebuilds. This is the normal upgrade path.
+- **Tarball sources**: the archive is downloaded, its SHA-256 is verified, and
+  it is extracted. Reinstalling a tarball refreshes the source from the verified
+  archive.
+
+Use `--reinstall` for a clean rebuild (`--fresh`), or `--force` to replace the
+destination entirely.
 
 Useful options:
 
 | Option | Meaning |
 | --- | --- |
-| `--branch <ref>` | Clone or check out a branch, tag, or commit |
+| `--branch <ref>` | Clone or check out a branch, tag, or commit (git sources) |
 | `--name <pkg>` | Override the package/manifest name |
-| `--dir <path>` | Exact clone destination |
+| `--dir <path>` | Exact source destination |
 | `--force` | Replace an existing destination |
 | `--reinstall` | Clean rebuild after updating |
-| `--build-system make\|cmake` | Force a build system |
+| `--build-system auto\|make\|cmake\|autotools` | Force a build system |
 | `--jobs <n>` | Parallel build jobs |
+| `--configure-args <args>` | Extra arguments for `./configure` (Autotools) |
+| `--make-args <args>` | Extra arguments for `make` |
+| `--sha256 <hex>` | SHA-256 for a direct tarball URL install |
 | `--allow-untracked` | Accept an install that ignores `DESTDIR` |
 | `--registry <path\|url>` | Registry file, directory, or git URL |
 | `--refresh` | Refresh the cached registry |
@@ -84,39 +95,76 @@ Install runs the project's build scripts. Only install packages you trust.
 
 ## The registry
 
-The registry is a tab-separated file named `packages.tsv` in the `registry/`
-directory of a git repository. The default source is this repository:
+The registry is a git-backed tap of package metadata. `illus` looks for
+per-package recipes first, then falls back to the legacy TSV file:
+
+- `<registry>/registry/packages/<name>.conf`
+- `<registry>/packages/<name>.conf`
+- `<registry>/registry/packages.tsv`
+- `<registry>/packages.tsv`
+
+A recipe with the same name overrides a TSV row. The default registry source is
+this repository:
 
 ```text
 https://github.com/campbell-nick/Dreams.git
 ```
 
-Format:
+### Recipe format
 
-```text
-# name<TAB>url<TAB>branch<TAB>description
-hello   https://github.com/example/hello.git   main   Example package
+Recipes are simple `key=value` files:
+
+```ini
+# GNU Stow
+name=stow
+version=2.4.1
+url=https://github.com/aspiers/stow.git
+branch=v2.4.1
+build=autotools
+source=git
+homepage=https://www.gnu.org/software/stow/
+description=Symlink farm manager for organizing software in a shared prefix
+depends=perl
 ```
 
-Blank lines and lines starting with `#` are ignored. `branch` may be empty to
-use the repository default. Override the registry with `--registry` or
-`ILLUS_REGISTRY`:
+Supported keys: `name`, `url`, `branch`, `description`, `version`, `build`,
+`source`, `sha256`, `depends`, `configure_args`, `make_args`, `homepage`.
+Unknown keys are ignored.
+
+`build` is `auto`, `make`, `cmake`, or `autotools`. `source` is `git` or
+`tarball` (inferred from the URL when omitted). Tarball sources require a
+64-character `sha256`. `depends` is recorded and displayed; dependency
+resolution is not automatic yet.
+
+### Legacy TSV format
+
+```text
+# name<TAB>url<TAB>branch<TAB>description<TAB>build<TAB>source<TAB>sha256<TAB>version
+hello   https://github.com/example/hello.git   main   Example package   auto   git
+```
+
+Blank lines and lines starting with `#` are ignored. Missing trailing columns
+are treated as empty.
+
+### Registry sources
+
+Override the registry with `--registry` or `ILLUS_REGISTRY`:
 
 ```bash
 ILLUS_REGISTRY=/path/to/packages.tsv illus search
-ILLUS_REGISTRY=/path/to/registry-repo illus install hello
+ILLUS_REGISTRY=/path/to/registry-repo illus install stow
 ILLUS_REGISTRY=https://github.com/example/registry.git illus install hello
 ```
 
 A local file or directory is used in place. A git URL is cloned into
 `~/.cache/illus/registry` and refreshed automatically after 24 hours, or
-immediately with `--refresh`. Registry entries are not verified: treat the
+immediately with `--refresh`. Registry entries run build scripts: treat the
 registry like any other source of executable code.
 
 ```bash
 illus search            # list everything
-illus search json       # substring match on name, URL, or description
-illus info <name>       # installed details, or registry details
+illus search stow       # substring match on name, URL, or description
+illus info stow         # installed details, or registry details
 ```
 
 ## Building the project directly

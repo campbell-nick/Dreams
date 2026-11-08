@@ -410,6 +410,174 @@ grep -q '"check":"home directory"' "$TMP/last.log" ||
 run "$BIN" doctor --verbose
 grep -q "paths: local=" "$TMP/last.log" || fail "doctor --verbose output"
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
+
+echo "== recipe registry: lookup/search/info and TSV override =="
+RREG="$TMP/recipe-registry"
+mkdir -p "$RREG/registry/packages"
+RHELLO="$TMP/src/recipe-hello"
+make_package "$RHELLO" recipe-hello
+init_repo "$RHELLO"
+commit_all "$RHELLO" init
+cat > "$RREG/registry/packages/recipe-hello.conf" <<EOF
+name=recipe-hello
+version=1.2.3
+url=$RHELLO
+branch=
+build=make
+source=git
+description=Recipe hello package
+depends=make
+homepage=https://example.invalid/recipe-hello
+EOF
+printf 'recipe-hello\t%s\t\tOld TSV description\toverride\tgit\t\t0.0.1\n' \
+    "$RHELLO" > "$RREG/registry/packages.tsv"
+export ILLUS_REGISTRY="$RREG"
+run "$BIN" search recipe-hello --json
+grep -q '"name":"recipe-hello"' "$TMP/last.log" || fail "recipe search"
+grep -q '"version":"1.2.3"' "$TMP/last.log" || fail "recipe search version"
+if grep -q 'Old TSV description' "$TMP/last.log"; then
+    fail "recipe did not override TSV row"
+fi
+run "$BIN" info recipe-hello --json
+grep -q '"installed":false' "$TMP/last.log" || fail "recipe info installed"
+grep -q '"build":"make"' "$TMP/last.log" || fail "recipe info build"
+grep -q '"depends":"make"' "$TMP/last.log" || fail "recipe info depends"
+run "$BIN" install recipe-hello
+[ -x "$BINDIR/recipe-hello" ] || fail "recipe install did not install"
+run "$BIN" remove recipe-hello
+unset ILLUS_REGISTRY
+
+echo "== tarball install: checksum success and mismatch =="
+TARSRC="$TMP/tar-src/tar-pkg-1.0"
+mkdir -p "$TARSRC"
+cat > "$TARSRC/main.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+cat > "$TARSRC/Makefile" <<'EOF'
+PREFIX ?= /usr/local
+all:
+	cc -o tar-hello main.c
+install:
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 tar-hello $(DESTDIR)$(PREFIX)/bin/tar-hello
+clean:
+	rm -f tar-hello
+EOF
+TARBALL="$TMP/tarballs/tar-pkg-1.0.tar.gz"
+mkdir -p "$TMP/tarballs"
+tar -czf "$TARBALL" -C "$TMP/tar-src" tar-pkg-1.0
+GOODSUM=$(sha256_of "$TARBALL")
+run "$BIN" install "$TARBALL" --name tar-pkg --sha256 "$GOODSUM"
+[ -x "$BINDIR/tar-hello" ] || fail "tarball install did not install"
+[ -f "$MDIR/tar-pkg.txt" ] || fail "tarball manifest missing"
+run "$BIN" remove tar-pkg
+run_fail "$BIN" install "$TARBALL" --name tar-bad --sha256 0000000000000000000000000000000000000000000000000000000000000000
+grep -q "SHA-256 mismatch" "$TMP/last.log" || fail "tarball mismatch not detected"
+[ ! -d "$DREAMS/tar-bad" ] || fail "failed tarball left destination behind"
+[ ! -e "$BINDIR/tar-hello" ] || fail "failed tarball install leaked files"
+run_fail "$BIN" install "$TARBALL" --name tar-no-sum
+grep -q "require a 64-character sha256" "$TMP/last.log" ||
+    fail "tarball without checksum was accepted"
+
+echo "== Autotools project and autoreconf bootstrap =="
+ASRC="$TMP/src/autotools-pkg"
+mkdir -p "$ASRC"
+cat > "$ASRC/main.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+cat > "$ASRC/configure" <<'EOF'
+#!/bin/sh
+set -eu
+prefix=/usr/local
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*) prefix=${arg#--prefix=} ;;
+    esac
+done
+cat > Makefile <<MK
+PREFIX = $prefix
+all:
+	cc -o auto-hello main.c
+install:
+	install -d \$(DESTDIR)\$(PREFIX)/bin
+	install -m 755 auto-hello \$(DESTDIR)\$(PREFIX)/bin/auto-hello
+distclean: clean
+	rm -f Makefile config.status
+clean:
+	rm -f auto-hello
+MK
+EOF
+chmod +x "$ASRC/configure"
+cat > "$ASRC/configure.ac" <<'EOF'
+AC_INIT([autotools-pkg], [1.0])
+EOF
+cat > "$ASRC/Makefile.am" <<'EOF'
+# fake
+EOF
+run_in "$ASRC" "$BIN" cast --store
+[ -x "$BINDIR/auto-hello" ] || fail "Autotools binary not installed"
+grep -q "^bin/auto-hello$" "$MDIR/autotools-pkg.txt" ||
+    fail "Autotools manifest path wrong"
+run "$BIN" remove autotools-pkg
+
+echo "== Autotools bootstrap with fake autoreconf =="
+BSRC="$TMP/src/bootstrap-pkg"
+mkdir -p "$BSRC"
+cat > "$BSRC/main.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+cat > "$BSRC/configure.ac" <<'EOF'
+AC_INIT([bootstrap-pkg], [1.0])
+EOF
+cat > "$BSRC/Makefile.am" <<'EOF'
+# fake
+EOF
+FAKEBIN="$TMP/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/autoreconf" <<'EOF'
+#!/bin/sh
+set -eu
+cat > configure <<'CFG'
+#!/bin/sh
+set -eu
+prefix=/usr/local
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*) prefix=${arg#--prefix=} ;;
+    esac
+done
+cat > Makefile <<MK
+PREFIX = $prefix
+all:
+	cc -o boot-hello main.c
+install:
+	install -d \$(DESTDIR)\$(PREFIX)/bin
+	install -m 755 boot-hello \$(DESTDIR)\$(PREFIX)/bin/boot-hello
+distclean: clean
+	rm -f Makefile
+clean:
+	rm -f boot-hello
+MK
+CFG
+chmod +x configure
+EOF
+chmod +x "$FAKEBIN/autoreconf"
+OLDPATH=$PATH
+PATH="$FAKEBIN:$PATH"
+run_in "$BSRC" "$BIN" cast --store
+PATH=$OLDPATH
+[ -x "$BINDIR/boot-hello" ] || fail "bootstrapped Autotools binary not installed"
+run "$BIN" remove bootstrap-pkg
+
 echo "== stale state and manifest cleanup =="
 if has_entry "$MDIR" '.manifest-*'; then
     fail "temporary manifest files were left behind"

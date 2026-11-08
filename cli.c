@@ -40,6 +40,9 @@ typedef enum {
     OPT_BUILD_SYSTEM,
     OPT_JOBS,
     OPT_DEPTH,
+    OPT_CONFIGURE_ARGS,
+    OPT_MAKE_ARGS,
+    OPT_SHA256,
     OPT_HELP,
     OPT_COUNT
 } opt_id;
@@ -74,6 +77,9 @@ static const opt_def option_defs[] = {
     {"build-system",    OPT_BUILD_SYSTEM,    1},
     {"jobs",            OPT_JOBS,            1},
     {"depth",           OPT_DEPTH,           1},
+    {"configure-args",  OPT_CONFIGURE_ARGS,  1},
+    {"make-args",       OPT_MAKE_ARGS,       1},
+    {"sha256",          OPT_SHA256,          1},
     {"help",            OPT_HELP,            0},
     {NULL,              OPT_COUNT,           0}
 };
@@ -85,7 +91,8 @@ static unsigned long long allowed_mask(cli_command command) {
                OPT_BIT(OPT_REINSTALL) | OPT_BIT(OPT_BRANCH) | OPT_BIT(OPT_NAME) |
                OPT_BIT(OPT_DIR) | OPT_BIT(OPT_REGISTRY) | OPT_BIT(OPT_REFRESH) |
                OPT_BIT(OPT_ALLOW_UNTRACKED) | OPT_BIT(OPT_JOBS) |
-               OPT_BIT(OPT_BUILD_SYSTEM);
+               OPT_BIT(OPT_BUILD_SYSTEM) | OPT_BIT(OPT_CONFIGURE_ARGS) |
+               OPT_BIT(OPT_MAKE_ARGS) | OPT_BIT(OPT_SHA256);
     case CLI_CMD_REMOVE:
         return OPT_COMMON | OPT_BIT(OPT_DRY_RUN);
     case CLI_CMD_LIST:
@@ -106,7 +113,8 @@ static unsigned long long allowed_mask(cli_command command) {
     case CLI_CMD_CAST:
         return OPT_COMMON | OPT_BIT(OPT_STORE) | OPT_BIT(OPT_FRESH) |
                OPT_BIT(OPT_BUILD_SYSTEM) | OPT_BIT(OPT_JOBS) |
-               OPT_BIT(OPT_ALLOW_UNTRACKED) | OPT_BIT(OPT_NAME);
+               OPT_BIT(OPT_ALLOW_UNTRACKED) | OPT_BIT(OPT_NAME) |
+               OPT_BIT(OPT_CONFIGURE_ARGS) | OPT_BIT(OPT_MAKE_ARGS);
     case CLI_CMD_DOCTOR:
         return OPT_BIT(OPT_JSON) | OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_HELP);
     case CLI_CMD_VERSION:
@@ -173,6 +181,8 @@ static void print_usage(const char *program, cli_command command) {
     case CLI_CMD_INSTALL:
         fprintf(stderr, "Usage: %s install <name|url> [--branch <ref>] [--name <pkg>]\n", program);
         fprintf(stderr, "       [--dir <path>] [--force] [--reinstall] [--dry-run]\n");
+        fprintf(stderr, "       [--build-system auto|make|cmake|autotools] [--sha256 <hex>]\n");
+        fprintf(stderr, "       [--configure-args <args>] [--make-args <args>]\n");
         break;
     case CLI_CMD_REMOVE:
         fprintf(stderr, "Usage: %s remove <package>... [--dry-run]\n", program);
@@ -194,8 +204,9 @@ static void print_usage(const char *program, cli_command command) {
         fprintf(stderr, "       [--name <pkg>] [--depth <n>] [--recursive] [--force] [--dry-run]\n");
         break;
     case CLI_CMD_CAST:
-        fprintf(stderr, "Usage: %s cast [--store] [--fresh] [--build-system make|cmake]\n", program);
-        fprintf(stderr, "       [--jobs <n>] [--name <pkg>] [--allow-untracked]\n");
+        fprintf(stderr, "Usage: %s cast [--store] [--fresh] [--build-system auto|make|cmake|autotools]\n", program);
+        fprintf(stderr, "       [--jobs <n>] [--name <pkg>] [--configure-args <args>] [--make-args <args>]\n");
+        fprintf(stderr, "       [--allow-untracked]\n");
         break;
     case CLI_CMD_DOCTOR:
         fprintf(stderr, "Usage: %s doctor [--json] [--verbose]\n", program);
@@ -270,6 +281,15 @@ static int apply_value(cli_parsed *parsed, opt_id id, const char *value) {
         return parse_positive_int(value, &parsed->opts.jobs);
     case OPT_DEPTH:
         return parse_positive_int(value, &parsed->opts.depth);
+    case OPT_CONFIGURE_ARGS:
+        parsed->opts.configure_args = value;
+        return 0;
+    case OPT_MAKE_ARGS:
+        parsed->opts.make_args = value;
+        return 0;
+    case OPT_SHA256:
+        parsed->opts.sha256 = value;
+        return 0;
     default:
         return -1;
     }
@@ -454,13 +474,16 @@ void cli_print_help(const char *program, cli_command command) {
         printf("Clone, build, and install a package into ~/.local.\n");
         printf("If <name> is found in the registry its URL is used automatically.\n\n");
         printf("Options:\n");
-        printf("  --branch <ref>       Clone/update a specific branch or tag\n");
+        printf("  --branch <ref>       Clone/update a specific branch or tag (git sources)\n");
         printf("  --name <pkg>         Override the package name\n");
-        printf("  --dir <path>         Clone destination (default ~/Dreams/<pkg>)\n");
-        printf("  --force              Re-clone even if the destination exists\n");
+        printf("  --dir <path>         Source destination (default ~/Dreams/<pkg>)\n");
+        printf("  --force              Replace an existing destination\n");
         printf("  --reinstall          Clean rebuild (--fresh) after updating\n");
-        printf("  --build-system <s>   Force 'make' or 'cmake'\n");
+        printf("  --build-system <s>   auto, make, cmake, or autotools\n");
         printf("  --jobs <n>           Parallel build jobs\n");
+        printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
+        printf("  --make-args <a>      Extra arguments for make\n");
+        printf("  --sha256 <hex>       Verify a tarball URL (required outside recipes)\n");
         printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
         printf("  --registry <path>    Registry file, directory, or git URL\n");
         printf("  --refresh            Refresh the cached registry\n");
@@ -522,8 +545,10 @@ void cli_print_help(const char *program, cli_command command) {
         printf("Options:\n");
         printf("  --store              Install into ~/.local and write a manifest\n");
         printf("  --fresh              Clean build artifacts first\n");
-        printf("  --build-system <s>   Force 'make' or 'cmake'\n");
+        printf("  --build-system <s>   auto, make, cmake, or autotools\n");
         printf("  --jobs <n>           Parallel build jobs\n");
+        printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
+        printf("  --make-args <a>      Extra arguments for make\n");
         printf("  --name <pkg>         Override the package name\n");
         printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
         break;

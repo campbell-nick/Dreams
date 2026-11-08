@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(illus VERSION 1.1.0 LANGUAGES C)
+project(illus VERSION 1.2.0 LANGUAGES C)
 
 # Set C standard to C99
 set(CMAKE_C_STANDARD 99)

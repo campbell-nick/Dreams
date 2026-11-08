@@ -6,12 +6,17 @@
 
 - Linux or macOS (other POSIX systems may work; Windows is not currently supported)
 - A C99 compiler (GCC or Clang)
-- `make` and/or `cmake`, depending on the project being built
-- `git` for `install`, `pull`, `update`, and the git-backed registry
+- `git` for git-backed installs, `pull`, `update`, and registry taps
+- Build tools as needed by packages: `make`, `cmake`, and/or Autotools
+  (`autoconf`, `automake`, `libtool`/`autoreconf`) for projects that need
+  bootstrapping
+- `tar` for tarball sources (`unzip` for `.zip`), plus `curl` or `wget` and a
+  SHA-256 tool (`sha256sum`, `shasum`, or `openssl`) for verified downloads
 - Standard coreutils (`install`, `mkdir`, `rm`, ...)
 
 `illus` uses POSIX APIs (`fork`, `execvp`, `dirent`, `pwd`, `lchown`,
-`mkdtemp`), so Windows is not supported.
+`mkdtemp`), so Windows is not supported. Use `illus doctor` to check for common
+missing tools.
 
 ## Building & Installing `Dreams`
 
@@ -69,14 +74,16 @@ This removes only the `illus` binary. Packages installed with `cast --store` or
 
 ## Registry access
 
-`illus install <name>`, `illus search`, and `illus info <name>` use a registry.
-The default is the `registry/packages.tsv` file in this repository, fetched with
-`git clone` into `~/.cache/illus/registry` on first use. No registry is needed
-if you always install from a URL or local path. To use your own registry:
+`illus install <name>`, `illus search`, and `illus info <name>` use a
+git-backed registry tap. The default is this repository, fetched with
+`git clone` into `~/.cache/illus/registry` on first use. The tap can contain
+per-package recipes under `registry/packages/<name>.conf` and/or a legacy
+`registry/packages.tsv`. No registry is needed if you always install from a URL
+or local path. To use your own registry:
 
 ```bash
 export ILLUS_REGISTRY="$HOME/my-registry/packages.tsv"
-# or a directory containing packages.tsv or registry/packages.tsv
+# or a directory containing recipes and/or packages.tsv
 export ILLUS_REGISTRY="$HOME/my-registry"
 # or a git repository
 export ILLUS_REGISTRY="https://github.com/example/registry.git"

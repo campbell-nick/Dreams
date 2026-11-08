@@ -1,6 +1,6 @@
 # Illution (illus)
 
-✦ Dreams Package Manager (illus) v1.1.0 ✦
+✦ Dreams Package Manager (illus) v1.2.0 ✦
 
 [![CI](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml/badge.svg)](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml)
 
@@ -16,8 +16,15 @@ not have to paste URLs.
 
 ## Features
 
-- **Name-based installs**: `illus install <name>` resolves the repository from
-  a git-backed registry; URLs and local paths work too.
+- **Name-based installs**: `illus install <name>` resolves recipes from a
+  git-backed registry tap; git URLs, local paths, and checksum-verified
+  tarballs work too.
+- **Recipe tap**: Per-package `.conf` recipes define version, source, build
+  system, checksum, dependencies, and build arguments; legacy TSV entries
+  still work.
+- **Build system detection**: Auto-detects Make, CMake, and Autotools. CMake
+  wins when both CMake and Autotools files exist; Autotools can bootstrap with
+  `autoreconf` when `configure` is missing.
 - **Stateless manifests**: The package name comes from the directory you build,
   and manifests are stored under `~/.local/share/illus/`. There is no central
   database to corrupt.
@@ -27,14 +34,13 @@ not have to paste URLs.
 - **Atomic updates**: Manifests are written to a temporary file and renamed
   into place. Failed installs and failed manifest writes are reported instead
   of printing a false success.
-- **Hardened pulls**: `pull` clones into a temporary sibling and swaps it into
-  place only after the clone succeeds. Existing destinations need `--force`,
-  and system paths and symlink escapes are refused.
+- **Hardened fetches**: Git clones and tarball downloads/extractions are staged
+  in a temporary sibling and swapped into place only after success. Tarballs
+  require a SHA-256 checksum. Existing destinations need `--force`, and system
+  paths and symlink escapes are refused.
 - **Dry runs and diagnostics**: `--dry-run` shows what a mutating command would
   do, and `illus doctor` checks paths, permissions, tools, manifests, and stale
   state.
-- **Build system detection**: Auto-detects `Makefile` and `CMakeLists.txt` with
-  prefix injection.
 - **Package or binary lookup**: `remove` accepts either the package name or an
   installed binary name.
 - **Root refusal**: Mutating commands refuse to run as root unless
