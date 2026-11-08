@@ -1,14 +1,13 @@
 # Illution (illus)
 
-✦ Dreams Package Manager (illus) v1.2.0 ✦
+✦ Dreams Package Manager (illus) v1.3.0 ✦
 
 [![CI](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml/badge.svg)](https://github.com/campbell-nick/Dreams/actions/workflows/ci.yml)
 
 A lightweight, stateless C package manager that builds and installs software
-into user space (`~/.local/`). It can clone a repository, build it with Make or
-CMake, install it with `DESTDIR` staging, and track every installed file in a
-manifest. A git-backed registry maps package names to repository URLs so you do
-not have to paste URLs.
+into user space (`~/.local/`) from a git or tarball URL. It detects Make,
+CMake, and Autotools projects, stages installs with `DESTDIR`, and tracks every
+installed file in a manifest for clean removal and verification.
 
 > **Warning:** This project is still in development. You may face bugs or
 > issues. Please report them if you find any. Read
@@ -16,18 +15,14 @@ not have to paste URLs.
 
 ## Features
 
-- **Name-based installs**: `illus install <name>` resolves recipes from a
-  git-backed registry tap; git URLs, local paths, and checksum-verified
-  tarballs work too.
-- **Recipe tap**: Per-package `.conf` recipes define version, source, build
-  system, checksum, dependencies, and build arguments; legacy TSV entries
-  still work.
+- **URL installs**: `illus install <git-or-tarball-url>` fetches the source,
+  builds it, and installs into `~/.local`. Tarball URLs require `--sha256`.
 - **Build system detection**: Auto-detects Make, CMake, and Autotools. CMake
   wins when both CMake and Autotools files exist; Autotools can bootstrap with
   `autoreconf` when `configure` is missing.
-- **Stateless manifests**: The package name comes from the directory you build,
-  and manifests are stored under `~/.local/share/illus/`. There is no central
-  database to corrupt.
+- **Stateless manifests**: The package name comes from the directory/URL you
+  install (or `--name`), and manifests are stored under
+  `~/.local/share/illus/`. There is no central database to corrupt.
 - **Safe staging**: Installs are staged with `DESTDIR` and moved into
   `~/.local` only after a successful build. Manifests record exactly the files
   the package installed, using paths relative to `~/.local`.
@@ -41,8 +36,8 @@ not have to paste URLs.
 - **Dry runs and diagnostics**: `--dry-run` shows what a mutating command would
   do, and `illus doctor` checks paths, permissions, tools, manifests, and stale
   state.
-- **Package or binary lookup**: `remove` accepts either the package name or an
-  installed binary name.
+- **Package or binary lookup**: `remove`/`info` accept either the package name
+  or an installed binary name where applicable.
 - **Root refusal**: Mutating commands refuse to run as root unless
   `ILLUS_ALLOW_ROOT=1` is set.
 
@@ -57,11 +52,12 @@ make
 make install
 ```
 
-Install a package by name, or directly from a URL:
+Install a package from a URL:
 
 ```bash
-illus install <name>
 illus install https://github.com/<owner>/<repo>.git
+illus install https://github.com/aspiers/stow.git --branch v2.4.1 --name stow
+illus install https://example.org/pkg-1.0.tar.gz --name pkg --sha256 <64-char-hex>
 ```
 
 List, inspect, and remove packages:
@@ -82,5 +78,5 @@ Make sure `~/.local/bin` is on your `PATH`. The original flags still work:
 | --- | --- |
 | [Warnings and safety](docs/Warnings.md) | Risk warning, safe-usage rules, known limitations |
 | [Installation](docs/Installation.md) | Requirements, building/installing `illus`, removing it |
-| [Usage](docs/Usage.md) | Commands, registry format, manifests, paths, exit status |
+| [Usage](docs/Usage.md) | Commands, manifests, paths, exit status |
 | [Troubleshooting](docs/Troubleshooting.md) | Common errors, `illus doctor`, fixes |

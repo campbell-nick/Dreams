@@ -13,7 +13,6 @@ typedef enum {
     CLI_CMD_REMOVE,
     CLI_CMD_LIST,
     CLI_CMD_INFO,
-    CLI_CMD_SEARCH,
     CLI_CMD_UPDATE,
     CLI_CMD_PULL,
     CLI_CMD_CAST,

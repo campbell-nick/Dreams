@@ -139,7 +139,7 @@ echo "== CLI =="
 run "$BIN" --version
 grep -q "Dreams Package Manager" "$TMP/last.log" || fail "version output"
 run "$BIN" --help
-grep -q "install <name|url>" "$TMP/last.log" || fail "help output"
+grep -q "install <url>" "$TMP/last.log" || fail "help output"
 run "$BIN" help
 run "$BIN" help install
 grep -q -- "--reinstall" "$TMP/last.log" || fail "install help"
@@ -298,27 +298,22 @@ ln -s /etc "$TMP/evil"
 run_fail "$BIN" pull "$REPO" --dir "$TMP/evil/illus-should-not-exist"
 [ ! -e /etc/illus-should-not-exist ] || fail "pull escaped through a symlink"
 
-echo "== registry: search/info/install/upgrade =="
-REG="$TMP/registry"
-mkdir -p "$REG"
+echo "== URL install/upgrade =="
 HELLO="$TMP/src/hello-git"
 make_package "$HELLO" hello
 init_repo "$HELLO"
 commit_all "$HELLO" init
-printf 'hello\t%s\t\tSay hello\n' "$HELLO" > "$REG/packages.tsv"
-export ILLUS_REGISTRY="$REG"
 
-run "$BIN" search hello
-grep -q "Say hello" "$TMP/last.log" || fail "search did not find hello"
-run "$BIN" search --json
-grep -q '"name":"hello"' "$TMP/last.log" || fail "search --json"
 run "$BIN" info hello
-grep -q "not installed" "$TMP/last.log" ||
-    fail "info did not use the registry"
-run "$BIN" install hello --dry-run
-[ ! -d "$DREAMS/hello" ] || fail "install --dry-run cloned"
-run "$BIN" install hello
-[ -x "$BINDIR/hello" ] || fail "registry install did not install hello"
+grep -q "no manifest found" "$TMP/last.log" ||
+    fail "info did not report missing manifest"
+expect_status 1 "$BIN" install hello
+grep -q "name-based install was removed" "$TMP/last.log" ||
+    fail "bare name install was not rejected"
+run "$BIN" install "$HELLO" --dry-run
+[ ! -d "$DREAMS/hello-git" ] && [ ! -d "$DREAMS/hello" ] || true
+run "$BIN" install "$HELLO" --name hello
+[ -x "$BINDIR/hello" ] || fail "URL install did not install hello"
 grep -q "^# source: $HELLO$" "$MDIR/hello.txt" ||
     fail "install did not record the source"
 run "$BIN" list
@@ -326,17 +321,17 @@ grep -q "hello" "$TMP/last.log" || fail "list did not show hello"
 
 printf '#!/bin/sh\necho version-two\n' > "$HELLO/hello"
 commit_all "$HELLO" "version two"
-run "$BIN" install hello
+run "$BIN" install "$HELLO" --name hello
 grep -q "version-two" "$BINDIR/hello" ||
     fail "install did not upgrade an existing package"
-run "$BIN" install hello --reinstall
+run "$BIN" install "$HELLO" --name hello --reinstall
 grep -q "Sweeping clean build artifacts" "$TMP/last.log" ||
     fail "install --reinstall did not use a fresh build"
 
 run "$BIN" info hello --files
 grep -q "$BINDIR/hello" "$TMP/last.log" || fail "info --files"
 
-run "$BIN" install hello --name hello-copy
+run "$BIN" install "$HELLO" --name hello-copy
 [ -x "$BINDIR/hello" ] || fail "install --name broke the install"
 [ -f "$MDIR/hello-copy.txt" ] || fail "install --name manifest missing"
 run "$BIN" remove hello-copy
@@ -345,12 +340,8 @@ run "$BIN" remove hello
 [ ! -e "$BINDIR/hello" ] || fail "hello binary not removed"
 [ ! -e "$MDIR/hello.txt" ] || fail "hello manifest not removed"
 run "$BIN" info hello
-grep -q "available in registry" "$TMP/last.log" ||
-    fail "info after remove did not fall back to the registry"
-
-run_fail "$BIN" install no-such-package
-grep -q "was not found in the registry" "$TMP/last.log" ||
-    fail "install accepted an unknown package"
+grep -q "no manifest found" "$TMP/last.log" ||
+    fail "info after remove did not report missing manifest"
 
 echo "== direct URL install =="
 URLPKG="$TMP/src/url-pkg"
@@ -362,27 +353,8 @@ run "$BIN" install "$URLPKG"
 [ -f "$MDIR/url-pkg.txt" ] || fail "URL install manifest missing"
 run "$BIN" remove url-pkg
 
-echo "== git-backed registry and refresh =="
-REGREPO="$TMP/registry-repo"
-mkdir -p "$REGREPO/registry"
-printf 'hello\t%s\t\tSay hello\n' "$HELLO" > "$REGREPO/registry/packages.tsv"
-init_repo "$REGREPO"
-commit_all "$REGREPO" init
-unset ILLUS_REGISTRY
-export ILLUS_REGISTRY="file://$REGREPO"
-run "$BIN" search hello
-[ -f "$ILLUS_HOME/.cache/illus/registry/registry/packages.tsv" ] ||
-    fail "git registry was not cached"
-printf 'hello\t%s\t\tSay hello\nsecond\t%s\t\tSecond package\n' \
-    "$HELLO" "$HELLO" > "$REGREPO/registry/packages.tsv"
-commit_all "$REGREPO" "add second"
-run "$BIN" search second --refresh
-grep -q "Second package" "$TMP/last.log" ||
-    fail "registry refresh did not fetch the new entry"
-unset ILLUS_REGISTRY
-
 echo "== update =="
-run "$BIN" install hello
+run "$BIN" install "$HELLO" --name hello
 run "$BIN" update --dry-run
 grep -q "would update hello" "$TMP/last.log" ||
     fail "update --dry-run did not list hello"
@@ -420,42 +392,6 @@ sha256_of() {
     fi
 }
 
-echo "== recipe registry: lookup/search/info and TSV override =="
-RREG="$TMP/recipe-registry"
-mkdir -p "$RREG/registry/packages"
-RHELLO="$TMP/src/recipe-hello"
-make_package "$RHELLO" recipe-hello
-init_repo "$RHELLO"
-commit_all "$RHELLO" init
-cat > "$RREG/registry/packages/recipe-hello.conf" <<EOF
-name=recipe-hello
-version=1.2.3
-url=$RHELLO
-branch=
-build=make
-source=git
-description=Recipe hello package
-depends=make
-homepage=https://example.invalid/recipe-hello
-EOF
-printf 'recipe-hello\t%s\t\tOld TSV description\toverride\tgit\t\t0.0.1\n' \
-    "$RHELLO" > "$RREG/registry/packages.tsv"
-export ILLUS_REGISTRY="$RREG"
-run "$BIN" search recipe-hello --json
-grep -q '"name":"recipe-hello"' "$TMP/last.log" || fail "recipe search"
-grep -q '"version":"1.2.3"' "$TMP/last.log" || fail "recipe search version"
-if grep -q 'Old TSV description' "$TMP/last.log"; then
-    fail "recipe did not override TSV row"
-fi
-run "$BIN" info recipe-hello --json
-grep -q '"installed":false' "$TMP/last.log" || fail "recipe info installed"
-grep -q '"build":"make"' "$TMP/last.log" || fail "recipe info build"
-grep -q '"depends":"make"' "$TMP/last.log" || fail "recipe info depends"
-run "$BIN" install recipe-hello
-[ -x "$BINDIR/recipe-hello" ] || fail "recipe install did not install"
-run "$BIN" remove recipe-hello
-unset ILLUS_REGISTRY
-
 echo "== tarball install: checksum success and mismatch =="
 TARSRC="$TMP/tar-src/tar-pkg-1.0"
 mkdir -p "$TARSRC"
@@ -485,7 +421,7 @@ grep -q "SHA-256 mismatch" "$TMP/last.log" || fail "tarball mismatch not detecte
 [ ! -d "$DREAMS/tar-bad" ] || fail "failed tarball left destination behind"
 [ ! -e "$BINDIR/tar-hello" ] || fail "failed tarball install leaked files"
 run_fail "$BIN" install "$TARBALL" --name tar-no-sum
-grep -q "require a 64-character sha256" "$TMP/last.log" ||
+grep -q "require --sha256" "$TMP/last.log" ||
     fail "tarball without checksum was accepted"
 
 echo "== Autotools project and autoreconf bootstrap =="

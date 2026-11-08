@@ -31,12 +31,10 @@ typedef enum {
     OPT_STORE,
     OPT_FRESH,
     OPT_RECURSIVE,
-    OPT_REFRESH,
     OPT_ALLOW_UNTRACKED,
     OPT_BRANCH,
     OPT_NAME,
     OPT_DIR,
-    OPT_REGISTRY,
     OPT_BUILD_SYSTEM,
     OPT_JOBS,
     OPT_DEPTH,
@@ -68,12 +66,10 @@ static const opt_def option_defs[] = {
     {"store",           OPT_STORE,           0},
     {"fresh",           OPT_FRESH,           0},
     {"recursive",       OPT_RECURSIVE,       0},
-    {"refresh",         OPT_REFRESH,         0},
     {"allow-untracked", OPT_ALLOW_UNTRACKED, 0},
     {"branch",          OPT_BRANCH,          1},
     {"name",            OPT_NAME,            1},
     {"dir",             OPT_DIR,             1},
-    {"registry",        OPT_REGISTRY,        1},
     {"build-system",    OPT_BUILD_SYSTEM,    1},
     {"jobs",            OPT_JOBS,            1},
     {"depth",           OPT_DEPTH,           1},
@@ -89,21 +85,17 @@ static unsigned long long allowed_mask(cli_command command) {
     case CLI_CMD_INSTALL:
         return OPT_COMMON | OPT_BIT(OPT_DRY_RUN) | OPT_BIT(OPT_FORCE) |
                OPT_BIT(OPT_REINSTALL) | OPT_BIT(OPT_BRANCH) | OPT_BIT(OPT_NAME) |
-               OPT_BIT(OPT_DIR) | OPT_BIT(OPT_REGISTRY) | OPT_BIT(OPT_REFRESH) |
-               OPT_BIT(OPT_ALLOW_UNTRACKED) | OPT_BIT(OPT_JOBS) |
-               OPT_BIT(OPT_BUILD_SYSTEM) | OPT_BIT(OPT_CONFIGURE_ARGS) |
-               OPT_BIT(OPT_MAKE_ARGS) | OPT_BIT(OPT_SHA256);
+               OPT_BIT(OPT_DIR) | OPT_BIT(OPT_ALLOW_UNTRACKED) |
+               OPT_BIT(OPT_JOBS) | OPT_BIT(OPT_BUILD_SYSTEM) |
+               OPT_BIT(OPT_CONFIGURE_ARGS) | OPT_BIT(OPT_MAKE_ARGS) |
+               OPT_BIT(OPT_SHA256);
     case CLI_CMD_REMOVE:
         return OPT_COMMON | OPT_BIT(OPT_DRY_RUN);
     case CLI_CMD_LIST:
         return OPT_BIT(OPT_ALL) | OPT_BIT(OPT_JSON) | OPT_BIT(OPT_VERBOSE) |
                OPT_BIT(OPT_VERIFY) | OPT_BIT(OPT_HELP);
     case CLI_CMD_INFO:
-        return OPT_COMMON | OPT_BIT(OPT_FILES) | OPT_BIT(OPT_JSON) |
-               OPT_BIT(OPT_REGISTRY) | OPT_BIT(OPT_REFRESH);
-    case CLI_CMD_SEARCH:
-        return OPT_BIT(OPT_JSON) | OPT_BIT(OPT_VERBOSE) | OPT_BIT(OPT_REGISTRY) |
-               OPT_BIT(OPT_REFRESH) | OPT_BIT(OPT_HELP);
+        return OPT_COMMON | OPT_BIT(OPT_FILES) | OPT_BIT(OPT_JSON);
     case CLI_CMD_UPDATE:
         return OPT_COMMON | OPT_BIT(OPT_DRY_RUN) | OPT_BIT(OPT_ALL);
     case CLI_CMD_PULL:
@@ -132,7 +124,6 @@ const char *cli_command_name(cli_command command) {
     case CLI_CMD_REMOVE:  return "remove";
     case CLI_CMD_LIST:    return "list";
     case CLI_CMD_INFO:    return "info";
-    case CLI_CMD_SEARCH:  return "search";
     case CLI_CMD_UPDATE:  return "update";
     case CLI_CMD_PULL:    return "pull";
     case CLI_CMD_CAST:    return "cast";
@@ -151,7 +142,6 @@ static cli_command command_from_word(const char *word) {
     if (strcmp(word, "list") == 0) return CLI_CMD_LIST;
     if (strcmp(word, "ls") == 0) return CLI_CMD_LIST;
     if (strcmp(word, "info") == 0) return CLI_CMD_INFO;
-    if (strcmp(word, "search") == 0) return CLI_CMD_SEARCH;
     if (strcmp(word, "update") == 0) return CLI_CMD_UPDATE;
     if (strcmp(word, "pull") == 0) return CLI_CMD_PULL;
     if (strcmp(word, "cast") == 0) return CLI_CMD_CAST;
@@ -168,7 +158,6 @@ static cli_command command_from_legacy(const char *flag) {
     if (strcmp(flag, "--uninstall") == 0) return CLI_CMD_REMOVE;
     if (strcmp(flag, "--list") == 0) return CLI_CMD_LIST;
     if (strcmp(flag, "--info") == 0) return CLI_CMD_INFO;
-    if (strcmp(flag, "--search") == 0) return CLI_CMD_SEARCH;
     if (strcmp(flag, "--update") == 0) return CLI_CMD_UPDATE;
     if (strcmp(flag, "--pull") == 0) return CLI_CMD_PULL;
     if (strcmp(flag, "--cast") == 0) return CLI_CMD_CAST;
@@ -179,7 +168,7 @@ static cli_command command_from_legacy(const char *flag) {
 static void print_usage(const char *program, cli_command command) {
     switch (command) {
     case CLI_CMD_INSTALL:
-        fprintf(stderr, "Usage: %s install <name|url> [--branch <ref>] [--name <pkg>]\n", program);
+        fprintf(stderr, "Usage: %s install <url> [--branch <ref>] [--name <pkg>]\n", program);
         fprintf(stderr, "       [--dir <path>] [--force] [--reinstall] [--dry-run]\n");
         fprintf(stderr, "       [--build-system auto|make|cmake|autotools] [--sha256 <hex>]\n");
         fprintf(stderr, "       [--configure-args <args>] [--make-args <args>]\n");
@@ -192,9 +181,6 @@ static void print_usage(const char *program, cli_command command) {
         break;
     case CLI_CMD_INFO:
         fprintf(stderr, "Usage: %s info <package> [--files] [--json]\n", program);
-        break;
-    case CLI_CMD_SEARCH:
-        fprintf(stderr, "Usage: %s search [term] [--json] [--refresh]\n", program);
         break;
     case CLI_CMD_UPDATE:
         fprintf(stderr, "Usage: %s update [--dry-run] [--all]\n", program);
@@ -271,9 +257,6 @@ static int apply_value(cli_parsed *parsed, opt_id id, const char *value) {
     case OPT_DIR:
         parsed->opts.dir = value;
         return 0;
-    case OPT_REGISTRY:
-        parsed->opts.registry = value;
-        return 0;
     case OPT_BUILD_SYSTEM:
         parsed->opts.build_system = value;
         return 0;
@@ -308,7 +291,6 @@ static void apply_flag(cli_parsed *parsed, opt_id id) {
     case OPT_STORE:           parsed->opts.store = 1; break;
     case OPT_FRESH:           parsed->opts.fresh = 1; break;
     case OPT_RECURSIVE:       parsed->opts.recursive = 1; break;
-    case OPT_REFRESH:         parsed->opts.refresh = 1; break;
     case OPT_ALLOW_UNTRACKED: parsed->opts.allow_untracked = 1; break;
     case OPT_HELP:            parsed->want_help = 1; break;
     default:                  break;
@@ -447,11 +429,10 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  %s <command> [options]\n", program);
         printf("  %s --<command> [options]    (legacy form)\n\n", program);
         printf("Commands:\n");
-        printf("  install <name|url>   Clone, build, and install a package\n");
+        printf("  install <url>        Fetch, build, and install a package from a URL\n");
         printf("  remove <name>...     Uninstall packages (alias: shed)\n");
         printf("  list                 List installed packages\n");
-        printf("  info <name>          Show details for an installed or available package\n");
-        printf("  search [term]        Search the package registry\n");
+        printf("  info <name>          Show details for an installed package\n");
         printf("  update               Pull, rebuild, and reinstall everything in ~/Dreams\n");
         printf("  pull <url>           Clone a repository\n");
         printf("  cast                 Build the current project\n");
@@ -460,7 +441,6 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  help [command]       Show help\n\n");
         printf("Environment:\n");
         printf("  ILLUS_HOME          Use a different home directory (tests/isolated installs)\n");
-        printf("  ILLUS_REGISTRY      Registry path or git URL (default: Dreams registry)\n");
         printf("  ILLUS_ALLOW_ROOT    Set to 1 to allow package operations as root\n");
         printf("  NO_COLOR            Disable ANSI colour output\n\n");
         printf("Run '%s help <command>' for command-specific options.\n", program);
@@ -470,9 +450,9 @@ void cli_print_help(const char *program, cli_command command) {
     printf("Dreams Package Manager (illus) v%s\n\n", ILLUS_VERSION);
     switch (command) {
     case CLI_CMD_INSTALL:
-        printf("Usage: %s install <name|url> [options]\n\n", program);
-        printf("Clone, build, and install a package into ~/.local.\n");
-        printf("If <name> is found in the registry its URL is used automatically.\n\n");
+        printf("Usage: %s install <url> [options]\n\n", program);
+        printf("Fetch, build, and install a package from a git or tarball URL into ~/.local.\n");
+        printf("Tarball URLs require --sha256.\n\n");
         printf("Options:\n");
         printf("  --branch <ref>       Clone/update a specific branch or tag (git sources)\n");
         printf("  --name <pkg>         Override the package name\n");
@@ -483,10 +463,8 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  --jobs <n>           Parallel build jobs\n");
         printf("  --configure-args <a> Extra arguments for ./configure (Autotools)\n");
         printf("  --make-args <a>      Extra arguments for make\n");
-        printf("  --sha256 <hex>       Verify a tarball URL (required outside recipes)\n");
+        printf("  --sha256 <hex>       SHA-256 for a tarball URL install\n");
         printf("  --allow-untracked    Accept installs that ignore DESTDIR\n");
-        printf("  --registry <path>    Registry file, directory, or git URL\n");
-        printf("  --refresh            Refresh the cached registry\n");
         printf("  --dry-run            Show what would happen without changing anything\n");
         break;
     case CLI_CMD_REMOVE:
@@ -505,21 +483,12 @@ void cli_print_help(const char *program, cli_command command) {
         break;
     case CLI_CMD_INFO:
         printf("Usage: %s info <package> [options]\n\n", program);
-        printf("Show manifest, registry, and file details for a package.\n\n");
+        printf("Show manifest and file details for an installed package.\n\n");
         printf("Options:\n");
         printf("  --files              List every tracked file\n");
         printf("  --json               Machine-readable output\n");
-        printf("  --registry <path>    Registry file, directory, or git URL\n");
-        printf("  --refresh            Refresh the cached registry\n");
         break;
-    case CLI_CMD_SEARCH:
-        printf("Usage: %s search [term] [options]\n\n", program);
-        printf("Search the package registry. With no term, lists every entry.\n\n");
-        printf("Options:\n");
-        printf("  --json               Machine-readable output\n");
-        printf("  --registry <path>    Registry file, directory, or git URL\n");
-        printf("  --refresh            Refresh the cached registry\n");
-        break;
+
     case CLI_CMD_UPDATE:
         printf("Usage: %s update [options]\n\n", program);
         printf("Pull, rebuild, and reinstall every project in ~/Dreams.\n\n");
@@ -616,12 +585,7 @@ int cli_main(int argc, char *argv[]) {
             return 2;
         }
         return cmd_info(&parsed.opts, parsed.args[0]);
-    case CLI_CMD_SEARCH:
-        if (parsed.nargs > 1) {
-            parse_error(program, parsed.command, "search accepts at most one term");
-            return 2;
-        }
-        return cmd_search(&parsed.opts, parsed.nargs == 1 ? parsed.args[0] : NULL);
+
     case CLI_CMD_PULL:
         if (parsed.nargs != 1) {
             parse_error(program, parsed.command, "pull requires exactly one repository URL");
@@ -630,7 +594,7 @@ int cli_main(int argc, char *argv[]) {
         return cmd_pull(&parsed.opts, parsed.args[0]);
     case CLI_CMD_INSTALL:
         if (parsed.nargs != 1) {
-            parse_error(program, parsed.command, "install requires exactly one package name or URL");
+            parse_error(program, parsed.command, "install requires exactly one repository or tarball URL");
             return 2;
         }
         return cmd_install(&parsed.opts, parsed.args[0]);

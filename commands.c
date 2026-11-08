@@ -25,12 +25,6 @@
 #include "commands.h"
 
 #define MANIFEST_HEADER      "# illus-manifest-v2"
-#define REGISTRY_FILE        "packages.tsv"
-#define REGISTRY_SUBDIR      "registry"
-#define REGISTRY_RECIPE_DIR  "packages"
-#define REGISTRY_RECIPE_EXT  ".conf"
-#define DEFAULT_REGISTRY_URL "https://github.com/campbell-nick/Dreams.git"
-#define REGISTRY_MAX_AGE     86400
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                             */
@@ -1003,25 +997,6 @@ static int derive_repo_name(const char *url, char *out, size_t out_size) {
     return is_valid_name(out) ? 0 : -1;
 }
 
-static int contains_ci(const char *haystack, const char *needle) {
-    size_t needle_len = strlen(needle);
-    const char *p;
-
-    if (needle_len == 0) return 1;
-    for (p = haystack; *p; p++) {
-        size_t i;
-        for (i = 0; i < needle_len; i++) {
-            if (!p[i]) return 0;
-            if (tolower((unsigned char)p[i]) !=
-                tolower((unsigned char)needle[i])) {
-                break;
-            }
-        }
-        if (i == needle_len) return 1;
-    }
-    return 0;
-}
-
 /* ------------------------------------------------------------------------- */
 /* String lists                                                              */
 /* ------------------------------------------------------------------------- */
@@ -1063,6 +1038,7 @@ static void strlist_free(strlist *l) {
     l->len = 0;
     l->cap = 0;
 }
+
 
 /* ------------------------------------------------------------------------- */
 /* Manifest handling                                                         */
@@ -1890,702 +1866,6 @@ static int resolve_pull_target(const illus_options *opts, const char *home,
 }
 
 /* ------------------------------------------------------------------------- */
-/* Registry                                                                  */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    char name[256];
-    char url[PATH_MAX];
-    char branch[256];
-    char description[512];
-    char version[64];
-    char build[32];
-    char source[16];
-    char sha256[65];
-    char depends[512];
-    char configure_args[512];
-    char make_args[512];
-    char homepage[PATH_MAX];
-} registry_entry;
-
-typedef struct {
-    char root[PATH_MAX];
-    int is_file;
-} registry_handle;
-
-static const char *registry_source(const illus_options *opts) {
-    const char *env = getenv("ILLUS_REGISTRY");
-
-    if (opts && opts->registry && *opts->registry) return opts->registry;
-    if (env && *env) return env;
-    return DEFAULT_REGISTRY_URL;
-}
-
-static int registry_cache_dir(const char *home, char *out, size_t out_size) {
-    const char *xdg = getenv("XDG_CACHE_HOME");
-    char base[PATH_MAX];
-
-    if (xdg && xdg[0] == '/') {
-        if (strlen(xdg) + 1 > sizeof base) return -1;
-        strcpy(base, xdg);
-    } else if (path_join(base, sizeof base, home, ".cache") != 0) {
-        return -1;
-    }
-    return path_join(out, out_size, base, "illus/registry");
-}
-
-static int registry_resolve(const illus_options *opts, const char *home,
-                            registry_handle *handle) {
-    const char *source = registry_source(opts);
-    struct stat st;
-
-    memset(handle, 0, sizeof *handle);
-    if (stat(source, &st) == 0) {
-        if (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode)) {
-            if (strlen(source) + 1 > sizeof handle->root) return -1;
-            strcpy(handle->root, source);
-            handle->is_file = S_ISREG(st.st_mode) ? 1 : 0;
-            return 0;
-        }
-        fprintf(stderr,
-                "[Dreams] Error: registry path is not a file or directory: %s\n",
-                source);
-        return -1;
-    }
-    if (!looks_like_url(source)) {
-        fprintf(stderr, "[Dreams] Error: registry not found: %s\n", source);
-        return -1;
-    }
-    if (registry_cache_dir(home, handle->root, sizeof handle->root) != 0) {
-        fprintf(stderr, "[Dreams] Error: registry cache path is too long.\n");
-        return -1;
-    }
-
-    {
-        char git_dir[PATH_MAX];
-        struct stat cache_st;
-        int need_update = opts->refresh;
-
-        if (path_join(git_dir, sizeof git_dir, handle->root, ".git") != 0) {
-            return -1;
-        }
-        if (stat(git_dir, &cache_st) != 0) {
-            char parent[PATH_MAX];
-            char *argv[8];
-            int n = 0;
-            struct stat root_st;
-
-            /*
-             * A previous clone may have been interrupted, leaving a partial
-             * directory without .git. It cannot be reused, and git clone
-             * refuses a non-empty destination, so remove it first.
-             */
-            if (lstat(handle->root, &root_st) == 0) {
-                if (S_ISLNK(root_st.st_mode) || !S_ISDIR(root_st.st_mode)) {
-                    if (unlink(handle->root) != 0) {
-                        perror("[Dreams] Error: could not clear registry cache");
-                        return -1;
-                    }
-                } else {
-                    remove_directory(handle->root);
-                }
-            }
-
-            if (parent_dir(handle->root, parent, sizeof parent) != 0) return -1;
-            if (mkdir_p(parent, 0755) != 0) {
-                perror("[Dreams] Error: could not create registry cache");
-                return -1;
-            }
-            printf("[Dreams] Fetching package registry from %s...\n", source);
-            argv[n++] = "git";
-            argv[n++] = "clone";
-            argv[n++] = "--depth";
-            argv[n++] = "1";
-            argv[n++] = "--";
-            argv[n++] = (char *)source;
-            argv[n++] = handle->root;
-            argv[n] = NULL;
-            if (run_cmd(argv) != 0) {
-                fprintf(stderr, "[Dreams] Error: could not fetch registry.\n");
-                remove_directory(handle->root);
-                return -1;
-            }
-        } else {
-            if (!need_update && stat(handle->root, &cache_st) == 0) {
-                time_t now = time(NULL);
-                if (now - cache_st.st_mtime > REGISTRY_MAX_AGE) need_update = 1;
-            }
-            if (need_update) {
-                printf("[Dreams] Refreshing package registry...\n");
-                if (git_pull_ff(handle->root) != 0) {
-                    fprintf(stderr,
-                            "[Dreams] Warning: could not refresh registry; using cached copy.\n");
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-static int registry_tsv_path(const registry_handle *handle, char *out,
-                             size_t out_size) {
-    char candidate[PATH_MAX];
-
-    if (handle->is_file) {
-        if (strlen(handle->root) + 1 > out_size) return -1;
-        strcpy(out, handle->root);
-        return 0;
-    }
-    if (path_join(candidate, sizeof candidate, handle->root,
-                  REGISTRY_SUBDIR "/" REGISTRY_FILE) == 0 &&
-        access(candidate, R_OK) == 0) {
-        if (strlen(candidate) + 1 > out_size) return -1;
-        strcpy(out, candidate);
-        return 0;
-    }
-    if (path_join(candidate, sizeof candidate, handle->root, REGISTRY_FILE) == 0 &&
-        access(candidate, R_OK) == 0) {
-        if (strlen(candidate) + 1 > out_size) return -1;
-        strcpy(out, candidate);
-        return 0;
-    }
-    return -1;
-}
-
-static int registry_recipe_dir(const registry_handle *handle, char *out,
-                               size_t out_size) {
-    char candidate[PATH_MAX];
-    struct stat st;
-
-    if (handle->is_file) return -1;
-    if (path_join(candidate, sizeof candidate, handle->root,
-                  REGISTRY_SUBDIR "/" REGISTRY_RECIPE_DIR) == 0 &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (strlen(candidate) + 1 > out_size) return -1;
-        strcpy(out, candidate);
-        return 0;
-    }
-    if (path_join(candidate, sizeof candidate, handle->root,
-                  REGISTRY_RECIPE_DIR) == 0 &&
-        stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (strlen(candidate) + 1 > out_size) return -1;
-        strcpy(out, candidate);
-        return 0;
-    }
-    return -1;
-}
-
-static int registry_recipe_path(const registry_handle *handle, const char *name,
-                                char *out, size_t out_size) {
-    char dir[PATH_MAX];
-    char filename[256];
-
-    if (registry_recipe_dir(handle, dir, sizeof dir) != 0) return -1;
-    if (make_filename(filename, sizeof filename, name, REGISTRY_RECIPE_EXT) != 0) {
-        return -1;
-    }
-    if (path_join(out, out_size, dir, filename) != 0) return -1;
-    return access(out, R_OK) == 0 ? 0 : -1;
-}
-
-static char *trim_ws(char *s) {
-    char *end;
-
-    while (*s && isspace((unsigned char)*s)) s++;
-    end = s + strlen(s);
-    while (end > s && isspace((unsigned char)end[-1])) end--;
-    *end = '\0';
-    return s;
-}
-
-static int registry_finalize(registry_entry *entry, const char *origin) {
-    if (!is_valid_name(entry->name)) {
-        if (origin) {
-            fprintf(stderr, "[Dreams] Error: %s: invalid package name '%s'.\n",
-                    origin, entry->name);
-        }
-        return -1;
-    }
-    if (validate_repo_url(entry->url) != 0) {
-        if (origin) {
-            fprintf(stderr, "[Dreams] Error: %s: invalid or missing url.\n", origin);
-        }
-        return -1;
-    }
-    if (entry->build[0] && strcmp(entry->build, "auto") != 0 &&
-        strcmp(entry->build, "make") != 0 &&
-        strcmp(entry->build, "cmake") != 0 &&
-        strcmp(entry->build, "autotools") != 0) {
-        if (origin) {
-            fprintf(stderr, "[Dreams] Error: %s: unknown build system '%s'.\n",
-                    origin, entry->build);
-        }
-        return -1;
-    }
-    if (entry->source[0] && strcmp(entry->source, "git") != 0 &&
-        strcmp(entry->source, "tarball") != 0) {
-        if (origin) {
-            fprintf(stderr, "[Dreams] Error: %s: unknown source type '%s'.\n",
-                    origin, entry->source);
-        }
-        return -1;
-    }
-    if (!entry->source[0]) {
-        copy_field(entry->source, sizeof entry->source,
-                   url_is_tarball(entry->url) ? "tarball" : "git");
-    }
-    if (strcmp(entry->source, "tarball") == 0) {
-        size_t i;
-
-        if (strlen(entry->sha256) != 64) {
-            if (origin) {
-                fprintf(stderr,
-                        "[Dreams] Error: %s: tarball sources require a 64-character sha256.\n",
-                        origin);
-            }
-            return -1;
-        }
-        for (i = 0; i < 64; i++) {
-            if (!isxdigit((unsigned char)entry->sha256[i])) {
-                if (origin) {
-                    fprintf(stderr, "[Dreams] Error: %s: sha256 is not hexadecimal.\n",
-                            origin);
-                }
-                return -1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int parse_registry_line(char *line, registry_entry *entry) {
-    char *fields[8];
-    int n = 0;
-    char *p = line;
-
-    while (n < 8) {
-        char *tab = strchr(p, '\t');
-        fields[n++] = p;
-        if (!tab) break;
-        *tab = '\0';
-        p = tab + 1;
-    }
-    if (n < 2) return -1;
-    memset(entry, 0, sizeof *entry);
-    copy_field(entry->name, sizeof entry->name, fields[0]);
-    copy_field(entry->url, sizeof entry->url, fields[1]);
-    if (n > 2) copy_field(entry->branch, sizeof entry->branch, fields[2]);
-    if (n > 3) copy_field(entry->description, sizeof entry->description, fields[3]);
-    if (n > 4) copy_field(entry->build, sizeof entry->build, fields[4]);
-    if (n > 5) copy_field(entry->source, sizeof entry->source, fields[5]);
-    if (n > 6) copy_field(entry->sha256, sizeof entry->sha256, fields[6]);
-    if (n > 7) copy_field(entry->version, sizeof entry->version, fields[7]);
-    return registry_finalize(entry, NULL);
-}
-
-static int parse_recipe_file(const char *path, registry_entry *entry) {
-    FILE *f;
-    char line[4096];
-    char stem[256];
-    const char *base;
-    size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
-
-    memset(entry, 0, sizeof *entry);
-    base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    copy_field(stem, sizeof stem, base);
-    if (strlen(stem) > ext_len &&
-        strcmp(stem + strlen(stem) - ext_len, REGISTRY_RECIPE_EXT) == 0) {
-        stem[strlen(stem) - ext_len] = '\0';
-    }
-    copy_field(entry->name, sizeof entry->name, stem);
-
-    f = fopen(path, "r");
-    if (!f) {
-        perror("[Dreams] Error: could not open recipe");
-        return -1;
-    }
-    while (fgets(line, sizeof line, f)) {
-        char *eq;
-        char *key;
-        char *value;
-
-        line[strcspn(line, "\r\n")] = '\0';
-        key = trim_ws(line);
-        if (!*key || *key == '#') continue;
-        eq = strchr(key, '=');
-        if (!eq) {
-            fprintf(stderr, "[Dreams] Error: %s: expected key=value.\n", path);
-            fclose(f);
-            return -1;
-        }
-        *eq = '\0';
-        value = trim_ws(eq + 1);
-        key = trim_ws(key);
-
-        if (strcmp(key, "name") == 0) {
-            copy_field(entry->name, sizeof entry->name, value);
-        } else if (strcmp(key, "url") == 0) {
-            copy_field(entry->url, sizeof entry->url, value);
-        } else if (strcmp(key, "branch") == 0) {
-            copy_field(entry->branch, sizeof entry->branch, value);
-        } else if (strcmp(key, "description") == 0) {
-            copy_field(entry->description, sizeof entry->description, value);
-        } else if (strcmp(key, "version") == 0) {
-            copy_field(entry->version, sizeof entry->version, value);
-        } else if (strcmp(key, "build") == 0) {
-            copy_field(entry->build, sizeof entry->build, value);
-        } else if (strcmp(key, "source") == 0) {
-            copy_field(entry->source, sizeof entry->source, value);
-        } else if (strcmp(key, "sha256") == 0) {
-            copy_field(entry->sha256, sizeof entry->sha256, value);
-        } else if (strcmp(key, "depends") == 0) {
-            copy_field(entry->depends, sizeof entry->depends, value);
-        } else if (strcmp(key, "configure_args") == 0) {
-            copy_field(entry->configure_args, sizeof entry->configure_args, value);
-        } else if (strcmp(key, "make_args") == 0) {
-            copy_field(entry->make_args, sizeof entry->make_args, value);
-        } else if (strcmp(key, "homepage") == 0) {
-            copy_field(entry->homepage, sizeof entry->homepage, value);
-        }
-        /* Unknown keys are ignored so taps can grow without breaking old clients. */
-    }
-    fclose(f);
-    return registry_finalize(entry, path);
-}
-
-static int registry_scan_recipes(const registry_handle *handle, const char *name,
-                                 registry_entry *out, int *found) {
-    char dir[PATH_MAX];
-    DIR *d;
-    struct dirent *p;
-    size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
-
-    *found = 0;
-    if (registry_recipe_dir(handle, dir, sizeof dir) != 0) return -1;
-    d = opendir(dir);
-    if (!d) return -1;
-    while ((p = readdir(d)) != NULL) {
-        char path[PATH_MAX];
-        registry_entry entry;
-        size_t len = strlen(p->d_name);
-
-        if (len <= ext_len ||
-            strcmp(p->d_name + len - ext_len, REGISTRY_RECIPE_EXT) != 0) {
-            continue;
-        }
-        if (path_join(path, sizeof path, dir, p->d_name) != 0) continue;
-        if (parse_recipe_file(path, &entry) != 0) continue;
-        if (strcmp(entry.name, name) == 0) {
-            *out = entry;
-            *found = 1;
-            break;
-        }
-    }
-    closedir(d);
-    return 0;
-}
-
-/* Returns 0 when found, 1 when absent, -1 on registry errors. */
-static int registry_lookup(const illus_options *opts, const char *home,
-                           const char *name, registry_entry *out) {
-    registry_handle handle;
-    char path[PATH_MAX];
-    char line[4096];
-    FILE *f;
-    int found = 0;
-
-    if (registry_resolve(opts, home, &handle) != 0) return -1;
-
-    if (!handle.is_file &&
-        registry_recipe_path(&handle, name, path, sizeof path) == 0) {
-        if (parse_recipe_file(path, out) != 0) return -1;
-        return 0;
-    }
-
-    if (registry_tsv_path(&handle, path, sizeof path) == 0) {
-        f = fopen(path, "r");
-        if (!f) {
-            perror("[Dreams] Error: could not open registry");
-            return -1;
-        }
-        while (fgets(line, sizeof line, f)) {
-            registry_entry entry;
-
-            line[strcspn(line, "\r\n")] = '\0';
-            if (!line[0] || line[0] == '#') continue;
-            if (parse_registry_line(line, &entry) != 0) continue;
-            if (strcmp(entry.name, name) == 0) {
-                *out = entry;
-                found = 1;
-                break;
-            }
-        }
-        fclose(f);
-        return found ? 0 : 1;
-    }
-
-    if (!handle.is_file) {
-        if (registry_scan_recipes(&handle, name, out, &found) == 0 && found) {
-            return 0;
-        }
-        if (registry_recipe_dir(&handle, path, sizeof path) == 0) return 1;
-    }
-    fprintf(stderr, "[Dreams] Error: registry file not found under %s\n",
-            handle.root);
-    return -1;
-}
-
-typedef int (*registry_visit_fn)(const registry_entry *entry, void *ctx);
-
-static int registry_foreach(const illus_options *opts, const char *home,
-                            registry_visit_fn visit, void *ctx) {
-    registry_handle handle;
-    char path[PATH_MAX];
-    char line[4096];
-    FILE *f;
-    int have_tsv = 0;
-    int have_recipes = 0;
-
-    if (registry_resolve(opts, home, &handle) != 0) return -1;
-
-    if (registry_tsv_path(&handle, path, sizeof path) == 0) {
-        have_tsv = 1;
-        f = fopen(path, "r");
-        if (!f) {
-            perror("[Dreams] Error: could not open registry");
-            return -1;
-        }
-        while (fgets(line, sizeof line, f)) {
-            registry_entry entry;
-            char recipe[PATH_MAX];
-
-            line[strcspn(line, "\r\n")] = '\0';
-            if (!line[0] || line[0] == '#') continue;
-            if (parse_registry_line(line, &entry) != 0) continue;
-            /* A recipe with the same name overrides the legacy TSV row. */
-            if (!handle.is_file &&
-                registry_recipe_path(&handle, entry.name, recipe,
-                                     sizeof recipe) == 0) {
-                continue;
-            }
-            if (visit(&entry, ctx) != 0) {
-                fclose(f);
-                return -1;
-            }
-        }
-        fclose(f);
-    }
-
-    if (!handle.is_file) {
-        char dir[PATH_MAX];
-        DIR *d;
-        struct dirent *p;
-        size_t ext_len = strlen(REGISTRY_RECIPE_EXT);
-
-        if (registry_recipe_dir(&handle, dir, sizeof dir) == 0) {
-            have_recipes = 1;
-            d = opendir(dir);
-            if (!d) {
-                perror("[Dreams] Error: could not open recipe directory");
-                return -1;
-            }
-            while ((p = readdir(d)) != NULL) {
-                registry_entry entry;
-                size_t len = strlen(p->d_name);
-
-                if (len <= ext_len ||
-                    strcmp(p->d_name + len - ext_len, REGISTRY_RECIPE_EXT) != 0) {
-                    continue;
-                }
-                if (path_join(path, sizeof path, dir, p->d_name) != 0) continue;
-                if (parse_recipe_file(path, &entry) != 0) continue;
-                if (visit(&entry, ctx) != 0) {
-                    closedir(d);
-                    return -1;
-                }
-            }
-            closedir(d);
-        }
-    }
-
-    if (!have_tsv && !have_recipes) {
-        fprintf(stderr, "[Dreams] Error: registry file not found under %s\n",
-                handle.root);
-        return -1;
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Installed package scanning                                                */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    char name[256];
-    char manifest[PATH_MAX];
-    size_t file_count;
-    size_t missing;
-    size_t unsafe;
-    unsigned long long bytes;
-    manifest_meta meta;
-} package_info;
-
-static void package_scan(package_info *pkg, const char *local_dir) {
-    strlist files;
-    size_t i;
-
-    memset(&files, 0, sizeof files);
-    if (manifest_read(&files, &pkg->meta, &pkg->unsafe, pkg->manifest,
-                      local_dir, NULL) != 0) {
-        strlist_free(&files);
-        return;
-    }
-    pkg->file_count = files.len;
-    for (i = 0; i < files.len; i++) {
-        struct stat st;
-        if (lstat(files.items[i], &st) != 0) {
-            pkg->missing++;
-            continue;
-        }
-        if (S_ISREG(st.st_mode)) {
-            pkg->bytes += (unsigned long long)st.st_size;
-        }
-    }
-    strlist_free(&files);
-}
-
-static int package_compare(const void *a, const void *b) {
-    const package_info *pa = (const package_info *)a;
-    const package_info *pb = (const package_info *)b;
-
-    return strcmp(pa->name, pb->name);
-}
-
-static int collect_packages(const char *manifest_dir, const char *local_dir,
-                            package_info **out, size_t *out_count) {
-    DIR *d;
-    struct dirent *entry;
-    package_info *items = NULL;
-    size_t count = 0;
-    size_t cap = 0;
-
-    *out = NULL;
-    *out_count = 0;
-    d = opendir(manifest_dir);
-    if (!d) {
-        if (errno == ENOENT) return 0;
-        perror("[Dreams] Error: could not read manifest directory");
-        return -1;
-    }
-    while ((entry = readdir(d)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        char manifest[PATH_MAX];
-        package_info *grown;
-
-        if (len < 5 || strcmp(entry->d_name + len - 4, ".txt") != 0) continue;
-        if (len - 4 >= sizeof items[0].name) continue;
-        if (path_join(manifest, sizeof manifest, manifest_dir,
-                      entry->d_name) != 0) {
-            continue;
-        }
-        if (count == cap) {
-            size_t ncap = cap ? cap * 2 : 8;
-            grown = realloc(items, ncap * sizeof *grown);
-            if (!grown) {
-                free(items);
-                closedir(d);
-                return -1;
-            }
-            items = grown;
-            cap = ncap;
-        }
-        memset(&items[count], 0, sizeof items[count]);
-        memcpy(items[count].name, entry->d_name, len - 4);
-        items[count].name[len - 4] = '\0';
-        strcpy(items[count].manifest, manifest);
-        package_scan(&items[count], local_dir);
-        count++;
-    }
-    closedir(d);
-    if (count > 1) {
-        qsort(items, count, sizeof *items, package_compare);
-    }
-    *out = items;
-    *out_count = count;
-    return 0;
-}
-
-static int binary_is_tracked(const package_info *pkgs, size_t count,
-                             const char *binary) {
-    size_t i;
-
-    for (i = 0; i < count; i++) {
-        FILE *f = fopen(pkgs[i].manifest, "r");
-        char line[PATH_MAX];
-
-        if (!f) continue;
-        while (fgets(line, sizeof line, f)) {
-            const char *base;
-            line[strcspn(line, "\r\n")] = '\0';
-            if (!line[0] || line[0] == '#') continue;
-            base = strrchr(line, '/');
-            base = base ? base + 1 : line;
-            if (strcmp(base, binary) == 0) {
-                fclose(f);
-                return 1;
-            }
-        }
-        fclose(f);
-    }
-    return 0;
-}
-
-static void manifest_package_name(const char *manifest, char *out,
-                                  size_t out_size) {
-    const char *base = strrchr(manifest, '/');
-    size_t len;
-
-    base = base ? base + 1 : manifest;
-    len = strlen(base);
-    if (len > 4 && strcmp(base + len - 4, ".txt") == 0) len -= 4;
-    if (len >= out_size) len = out_size - 1;
-    memcpy(out, base, len);
-    out[len] = '\0';
-}
-
-static int string_compare(const void *a, const void *b) {
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
-
-/* Collect and sort untracked executable names from ~/.local/bin. */
-static int collect_untracked(const package_info *pkgs, size_t count,
-                             const char *bin_dir, strlist *names) {
-    DIR *d = opendir(bin_dir);
-    struct dirent *entry;
-
-    if (!d) return 0;
-    while ((entry = readdir(d)) != NULL) {
-        char path[PATH_MAX];
-        struct stat st;
-
-        if (entry->d_name[0] == '.') continue;
-        if (path_join(path, sizeof path, bin_dir, entry->d_name) != 0) continue;
-        if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) continue;
-        if (binary_is_tracked(pkgs, count, entry->d_name)) continue;
-        if (strlist_add(names, entry->d_name) != 0) {
-            closedir(d);
-            return -1;
-        }
-    }
-    closedir(d);
-    if (names->len > 1) {
-        qsort(names->items, names->len, sizeof *names->items, string_compare);
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------------- */
 /* Pull command                                                              */
 /* ------------------------------------------------------------------------- */
 
@@ -3181,14 +2461,13 @@ int cmd_install(const illus_options *opts, const char *spec) {
     char name[256];
     char branch[256];
     char target[PATH_MAX];
-    registry_entry entry;
     struct stat st;
     int is_tarball;
     int rc;
 
     if (refuse_root("install")) return 1;
     if (!spec || !*spec) {
-        fprintf(stderr, "[Dreams] Error: install requires a package name or URL.\n");
+        fprintf(stderr, "[Dreams] Error: install requires a repository or tarball URL.\n");
         return 1;
     }
 
@@ -3198,7 +2477,6 @@ int cmd_install(const illus_options *opts, const char *spec) {
         return 1;
     }
 
-    memset(&entry, 0, sizeof entry);
     memset(url, 0, sizeof url);
     memset(name, 0, sizeof name);
     branch[0] = '\0';
@@ -3206,38 +2484,20 @@ int cmd_install(const illus_options *opts, const char *spec) {
         copy_field(branch, sizeof branch, opts->branch);
     }
 
-    if (is_valid_name(spec) && !looks_like_url(spec)) {
-        rc = registry_lookup(opts, home, spec, &entry);
-        if (rc == 0) {
-            copy_field(url, sizeof url, entry.url);
-            copy_field(name, sizeof name, entry.name);
-            if (!branch[0] && entry.branch[0]) {
-                copy_field(branch, sizeof branch, entry.branch);
-            }
-        } else if (rc > 0) {
-            fprintf(stderr,
-                    "[Dreams] Error: package '%s' was not found in the registry.\n",
-                    spec);
-            fprintf(stderr,
-                    "[Dreams] Try 'illus search %s' or pass a repository URL.\n",
-                    spec);
-            free(home);
-            return 1;
-        } else {
-            free(home);
-            return 1;
-        }
-    } else {
-        copy_field(url, sizeof url, spec);
-        if (derive_repo_name(url, name, sizeof name) != 0) {
-            fprintf(stderr,
-                    "[Dreams] Error: could not derive a package name from the URL.\n");
-            fprintf(stderr, "[Dreams] Use --name <pkg> to set one.\n");
-            free(home);
-            return 1;
-        }
+    if (is_valid_name(spec) && !looks_like_url(spec) && !url_is_tarball(spec) &&
+        strchr(spec, '/') == NULL && access(spec, F_OK) != 0) {
+        fprintf(stderr,
+                "[Dreams] Error: name-based install was removed; '%s' is not a URL.\n",
+                spec);
+        fprintf(stderr,
+                "[Dreams] Pass a repository or tarball URL, for example:\n");
+        fprintf(stderr, "[Dreams]   illus install https://github.com/owner/%s.git\n",
+                spec);
+        free(home);
+        return 1;
     }
 
+    copy_field(url, sizeof url, spec);
     if (opts->name && *opts->name) {
         if (!is_valid_name(opts->name)) {
             fprintf(stderr, "[Dreams] Error: invalid --name '%s'.\n", opts->name);
@@ -3245,29 +2505,30 @@ int cmd_install(const illus_options *opts, const char *spec) {
             return 1;
         }
         copy_field(name, sizeof name, opts->name);
+    } else if (derive_repo_name(url, name, sizeof name) != 0) {
+        fprintf(stderr,
+                "[Dreams] Error: could not derive a package name from the URL.\n");
+        fprintf(stderr, "[Dreams] Use --name <pkg> to set one.\n");
+        free(home);
+        return 1;
     }
+
     if (!is_valid_name(name)) {
         fprintf(stderr, "[Dreams] Error: invalid package name '%s'.\n", name);
         free(home);
         return 1;
     }
     if (validate_repo_url(url) != 0) {
-        fprintf(stderr, "[Dreams] Error: invalid repository URL.\n");
+        fprintf(stderr, "[Dreams] Error: invalid repository or tarball URL.\n");
         free(home);
         return 1;
     }
 
-    is_tarball = (strcmp(entry.source, "tarball") == 0) ||
-                 (entry.source[0] == '\0' && url_is_tarball(url));
+    is_tarball = url_is_tarball(url);
     if (is_tarball) {
-        if (!entry.sha256[0] && opts->sha256 && *opts->sha256) {
-            copy_field(entry.sha256, sizeof entry.sha256, opts->sha256);
-        }
-        if (strlen(entry.sha256) != 64) {
+        if (!opts->sha256 || strlen(opts->sha256) != 64) {
             fprintf(stderr,
-                    "[Dreams] Error: tarball installs require a 64-character sha256.\n");
-            fprintf(stderr,
-                    "[Dreams] Use a registry recipe or pass --sha256 <hex>.\n");
+                    "[Dreams] Error: tarball installs require --sha256 <64-char hex>.\n");
             free(home);
             return 1;
         }
@@ -3277,21 +2538,6 @@ int cmd_install(const illus_options *opts, const char *spec) {
             free(home);
             return 1;
         }
-        copy_field(entry.source, sizeof entry.source, "tarball");
-    } else {
-        copy_field(entry.source, sizeof entry.source, "git");
-    }
-    copy_field(entry.name, sizeof entry.name, name);
-    copy_field(entry.url, sizeof entry.url, url);
-    if (!entry.build[0] && opts->build_system && *opts->build_system) {
-        copy_field(entry.build, sizeof entry.build, opts->build_system);
-    }
-    if (!entry.configure_args[0] && opts->configure_args) {
-        copy_field(entry.configure_args, sizeof entry.configure_args,
-                   opts->configure_args);
-    }
-    if (!entry.make_args[0] && opts->make_args) {
-        copy_field(entry.make_args, sizeof entry.make_args, opts->make_args);
     }
 
     if (resolve_pull_target(opts, home, name, target, sizeof target) != 0) {
@@ -3337,7 +2583,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
                 free(home);
                 return 0;
             }
-            if (fetch_tarball_atomic(entry.url, entry.sha256, target, 1, home,
+            if (fetch_tarball_atomic(url, opts->sha256, target, 1, home,
                                      uid, gid) != 0) {
                 free(home);
                 return 1;
@@ -3415,7 +2661,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
             return 0;
         }
         if (is_tarball) {
-            if (fetch_tarball_atomic(entry.url, entry.sha256, target, 0, home,
+            if (fetch_tarball_atomic(url, opts->sha256, target, 0, home,
                                      uid, gid) != 0) {
                 free(home);
                 return 1;
@@ -3455,15 +2701,6 @@ int cmd_install(const illus_options *opts, const char *spec) {
         cast_opts.branch = branch[0] ? branch : NULL;
         cast_opts.dir = NULL;
         cast_opts.dry_run = 0;
-        if (entry.build[0] && strcmp(entry.build, "auto") != 0) {
-            cast_opts.build_system = entry.build;
-        }
-        if (entry.configure_args[0]) {
-            cast_opts.configure_args = entry.configure_args;
-        }
-        if (entry.make_args[0]) {
-            cast_opts.make_args = entry.make_args;
-        }
         rc = cmd_cast(&cast_opts);
         if (chdir(cwd) != 0) {
             perror("[Dreams] Warning: could not restore working directory");
@@ -3473,6 +2710,7 @@ int cmd_install(const illus_options *opts, const char *spec) {
     free(home);
     return rc;
 }
+
 
 /* ------------------------------------------------------------------------- */
 /* Update command                                                            */
@@ -3841,6 +3079,170 @@ int cmd_shed(const illus_options *opts, const char *package_name) {
     return failures == 0 ? 0 : 1;
 }
 
+typedef struct {
+    char name[256];
+    char manifest[PATH_MAX];
+    size_t file_count;
+    size_t missing;
+    size_t unsafe;
+    unsigned long long bytes;
+    manifest_meta meta;
+} package_info;
+
+static void package_scan(package_info *pkg, const char *local_dir) {
+    strlist files;
+    size_t i;
+
+    memset(&files, 0, sizeof files);
+    if (manifest_read(&files, &pkg->meta, &pkg->unsafe, pkg->manifest,
+                      local_dir, NULL) != 0) {
+        strlist_free(&files);
+        return;
+    }
+    pkg->file_count = files.len;
+    for (i = 0; i < files.len; i++) {
+        struct stat st;
+        if (lstat(files.items[i], &st) != 0) {
+            pkg->missing++;
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            pkg->bytes += (unsigned long long)st.st_size;
+        }
+    }
+    strlist_free(&files);
+}
+
+static int package_compare(const void *a, const void *b) {
+    const package_info *pa = (const package_info *)a;
+    const package_info *pb = (const package_info *)b;
+
+    return strcmp(pa->name, pb->name);
+}
+
+static int collect_packages(const char *manifest_dir, const char *local_dir,
+                            package_info **out, size_t *out_count) {
+    DIR *d;
+    struct dirent *entry;
+    package_info *items = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+
+    *out = NULL;
+    *out_count = 0;
+    d = opendir(manifest_dir);
+    if (!d) {
+        if (errno == ENOENT) return 0;
+        perror("[Dreams] Error: could not read manifest directory");
+        return -1;
+    }
+    while ((entry = readdir(d)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        char manifest[PATH_MAX];
+        package_info *grown;
+
+        if (len < 5 || strcmp(entry->d_name + len - 4, ".txt") != 0) continue;
+        if (len - 4 >= sizeof items[0].name) continue;
+        if (path_join(manifest, sizeof manifest, manifest_dir,
+                      entry->d_name) != 0) {
+            continue;
+        }
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 8;
+            grown = realloc(items, ncap * sizeof *grown);
+            if (!grown) {
+                free(items);
+                closedir(d);
+                return -1;
+            }
+            items = grown;
+            cap = ncap;
+        }
+        memset(&items[count], 0, sizeof items[count]);
+        memcpy(items[count].name, entry->d_name, len - 4);
+        items[count].name[len - 4] = '\0';
+        strcpy(items[count].manifest, manifest);
+        package_scan(&items[count], local_dir);
+        count++;
+    }
+    closedir(d);
+    if (count > 1) {
+        qsort(items, count, sizeof *items, package_compare);
+    }
+    *out = items;
+    *out_count = count;
+    return 0;
+}
+
+static int binary_is_tracked(const package_info *pkgs, size_t count,
+                             const char *binary) {
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        FILE *f = fopen(pkgs[i].manifest, "r");
+        char line[PATH_MAX];
+
+        if (!f) continue;
+        while (fgets(line, sizeof line, f)) {
+            const char *base;
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0] || line[0] == '#') continue;
+            base = strrchr(line, '/');
+            base = base ? base + 1 : line;
+            if (strcmp(base, binary) == 0) {
+                fclose(f);
+                return 1;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+static void manifest_package_name(const char *manifest, char *out,
+                                  size_t out_size) {
+    const char *base = strrchr(manifest, '/');
+    size_t len;
+
+    base = base ? base + 1 : manifest;
+    len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".txt") == 0) len -= 4;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, base, len);
+    out[len] = '\0';
+}
+
+static int string_compare(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Collect and sort untracked executable names from ~/.local/bin. */
+static int collect_untracked(const package_info *pkgs, size_t count,
+                             const char *bin_dir, strlist *names) {
+    DIR *d = opendir(bin_dir);
+    struct dirent *entry;
+
+    if (!d) return 0;
+    while ((entry = readdir(d)) != NULL) {
+        char path[PATH_MAX];
+        struct stat st;
+
+        if (entry->d_name[0] == '.') continue;
+        if (path_join(path, sizeof path, bin_dir, entry->d_name) != 0) continue;
+        if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) continue;
+        if (binary_is_tracked(pkgs, count, entry->d_name)) continue;
+        if (strlist_add(names, entry->d_name) != 0) {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
+    if (names->len > 1) {
+        qsort(names->items, names->len, sizeof *names->items, string_compare);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 /* List command                                                              */
 /* ------------------------------------------------------------------------- */
@@ -4024,7 +3426,6 @@ int cmd_info(const illus_options *opts, const char *name) {
     size_t i;
     int found = 0;
     int via_binary = 0;
-    registry_entry entry;
 
     if (!is_valid_name(name)) {
         fprintf(stderr, "[Dreams] Error: Invalid package name \"%s\"\n", name);
@@ -4049,7 +3450,7 @@ int cmd_info(const illus_options *opts, const char *name) {
         if (make_filename(filename, sizeof filename, name, ".txt") == 0 &&
             path_join(direct, sizeof direct, manifest_dir, filename) == 0 &&
             access(direct, R_OK) == 0) {
-            strcpy(manifest, direct);
+            copy_field(manifest, sizeof manifest, direct);
             found = 1;
         }
     }
@@ -4070,75 +3471,18 @@ int cmd_info(const illus_options *opts, const char *name) {
     }
 
     if (!found) {
-        int rc = registry_lookup(opts, home, name, &entry);
-
-        if (rc == 0) {
-            if (opts->json) {
-                printf("{\"name\":");
-                json_string(stdout, entry.name);
-                printf(",\"installed\":false,\"url\":");
-                json_string(stdout, entry.url);
-                if (entry.version[0]) {
-                    printf(",\"version\":");
-                    json_string(stdout, entry.version);
-                }
-                if (entry.branch[0]) {
-                    printf(",\"branch\":");
-                    json_string(stdout, entry.branch);
-                }
-                if (entry.build[0]) {
-                    printf(",\"build\":");
-                    json_string(stdout, entry.build);
-                }
-                if (entry.source[0]) {
-                    printf(",\"source_type\":");
-                    json_string(stdout, entry.source);
-                }
-                if (entry.sha256[0]) {
-                    printf(",\"sha256\":");
-                    json_string(stdout, entry.sha256);
-                }
-                if (entry.depends[0]) {
-                    printf(",\"depends\":");
-                    json_string(stdout, entry.depends);
-                }
-                if (entry.homepage[0]) {
-                    printf(",\"homepage\":");
-                    json_string(stdout, entry.homepage);
-                }
-                if (entry.description[0]) {
-                    printf(",\"description\":");
-                    json_string(stdout, entry.description);
-                }
-                printf("}\n");
-            } else {
-                printf("\nPackage: %s\n", entry.name);
-                printf("Status: not installed (available in registry)\n");
-                if (entry.version[0]) printf("Version: %s\n", entry.version);
-                if (entry.build[0]) printf("Build: %s\n", entry.build);
-                if (entry.source[0]) printf("Source type: %s\n", entry.source);
-                printf("URL: %s\n", entry.url);
-                if (entry.branch[0]) printf("Branch: %s\n", entry.branch);
-                if (entry.homepage[0]) printf("Homepage: %s\n", entry.homepage);
-                if (entry.depends[0]) printf("Depends: %s\n", entry.depends);
-                if (entry.sha256[0]) printf("SHA-256: %s\n", entry.sha256);
-                if (entry.description[0]) {
-                    printf("Description: %s\n", entry.description);
-                }
-                printf("\nInstall with: illus install %s\n\n", entry.name);
-            }
-            free(home);
-            return 0;
+        if (opts->json) {
+            printf("{\"name\":");
+            json_string(stdout, name);
+            printf(",\"installed\":false}\n");
+        } else {
+            printf("\nPackage: %s\n", name);
+            printf("Status: not installed (no manifest found)\n");
+            printf("\nInstall from a URL with: illus install <url> --name %s\n\n",
+                   name);
         }
-        if (rc < 0) {
-            free(home);
-            return 1;
-        }
-        fprintf(stderr,
-                "[Dreams] Error: package '%s' is not installed and was not found in the registry.\n",
-                name);
         free(home);
-        return 1;
+        return 0;
     }
 
     if (via_binary) {
@@ -4231,114 +3575,6 @@ int cmd_info(const illus_options *opts, const char *name) {
     return 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Search command                                                            */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    const illus_options *opts;
-    const char *term;
-    int found;
-    int first_json;
-} search_ctx;
-
-static int search_visit(const registry_entry *entry, void *vctx) {
-    search_ctx *ctx = vctx;
-
-    if (ctx->term && *ctx->term &&
-        !contains_ci(entry->name, ctx->term) &&
-        !contains_ci(entry->description, ctx->term) &&
-        !contains_ci(entry->url, ctx->term)) {
-        return 0;
-    }
-    ctx->found++;
-    if (ctx->opts->json) {
-        if (!ctx->first_json) printf(",");
-        ctx->first_json = 0;
-        printf("{\"name\":");
-        json_string(stdout, entry->name);
-        printf(",\"url\":");
-        json_string(stdout, entry->url);
-        if (entry->version[0]) {
-            printf(",\"version\":");
-            json_string(stdout, entry->version);
-        }
-        if (entry->branch[0]) {
-            printf(",\"branch\":");
-            json_string(stdout, entry->branch);
-        }
-        if (entry->build[0]) {
-            printf(",\"build\":");
-            json_string(stdout, entry->build);
-        }
-        if (entry->source[0]) {
-            printf(",\"source_type\":");
-            json_string(stdout, entry->source);
-        }
-        if (entry->description[0]) {
-            printf(",\"description\":");
-            json_string(stdout, entry->description);
-        }
-        printf("}");
-    } else if (ctx->opts->verbose) {
-        printf("  %-24s %-10s %-10s %-40s %s\n", entry->name,
-               entry->version[0] ? entry->version : "-",
-               entry->build[0] ? entry->build : "auto", entry->url,
-               entry->description);
-    } else {
-        const char *detail = entry->version[0] ? entry->version :
-                             (entry->branch[0] ? entry->branch : "-");
-
-        printf("  %-24s %-12s %s\n", entry->name, detail,
-               entry->description);
-    }
-    return 0;
-}
-
-int cmd_search(const illus_options *opts, const char *term) {
-    char *home;
-    search_ctx ctx;
-
-    home = get_real_home(NULL, NULL);
-    if (!home) {
-        fprintf(stderr, "[Dreams] Error: Could not determine home directory.\n");
-        return 1;
-    }
-
-    if (opts->json) {
-        printf("[");
-    } else {
-        if (term && *term) {
-            printf("\nSearch results for '%s':\n", term);
-        } else {
-            printf("\nRegistry packages:\n");
-        }
-        if (opts->verbose) {
-            printf("  %-24s %-10s %-10s %-40s %s\n", "NAME", "VERSION",
-                   "BUILD", "URL", "DESCRIPTION");
-        } else {
-            printf("  %-24s %-12s %s\n", "NAME", "VERSION", "DESCRIPTION");
-        }
-    }
-
-    memset(&ctx, 0, sizeof ctx);
-    ctx.opts = opts;
-    ctx.term = term;
-    ctx.first_json = 1;
-    if (registry_foreach(opts, home, search_visit, &ctx) != 0) {
-        free(home);
-        return 1;
-    }
-
-    if (opts->json) {
-        printf("]\n");
-    } else {
-        if (ctx.found == 0) printf("  (no matches)\n");
-        printf("\n");
-    }
-    free(home);
-    return 0;
-}
 
 /* ------------------------------------------------------------------------- */
 /* Doctor command                                                            */
@@ -4566,20 +3802,6 @@ int cmd_doctor(const illus_options *opts) {
             doctor_emit(&state, "pass", "untracked binaries", "");
         }
         strlist_free(&untracked);
-    }
-
-    {
-        const char *source = registry_source(opts);
-        struct stat rst;
-
-        if (stat(source, &rst) == 0) {
-            doctor_emit(&state, "pass", "registry", source);
-        } else if (looks_like_url(source)) {
-            doctor_emit(&state, "pass", "registry",
-                        "remote (cached on demand)");
-        } else {
-            doctor_emit(&state, "warn", "registry", "not found");
-        }
     }
 
 done:

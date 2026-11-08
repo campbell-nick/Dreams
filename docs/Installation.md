@@ -6,7 +6,7 @@
 
 - Linux or macOS (other POSIX systems may work; Windows is not currently supported)
 - A C99 compiler (GCC or Clang)
-- `git` for git-backed installs, `pull`, `update`, and registry taps
+- `git` for git URL installs, `pull`, and `update`
 - Build tools as needed by packages: `make`, `cmake`, and/or Autotools
   (`autoconf`, `automake`, `libtool`/`autoreconf`) for projects that need
   bootstrapping
@@ -72,23 +72,6 @@ This removes only the `illus` binary. Packages installed with `cast --store` or
 `install` must be removed with `illus remove <package-or-binary>`. See
 [Usage](Usage.md).
 
-## Registry access
-
-`illus install <name>`, `illus search`, and `illus info <name>` use a
-git-backed registry tap. The default is this repository, fetched with
-`git clone` into `~/.cache/illus/registry` on first use. The tap can contain
-per-package recipes under `registry/packages/<name>.conf` and/or a legacy
-`registry/packages.tsv`. No registry is needed if you always install from a URL
-or local path. To use your own registry:
-
-```bash
-export ILLUS_REGISTRY="$HOME/my-registry/packages.tsv"
-# or a directory containing recipes and/or packages.tsv
-export ILLUS_REGISTRY="$HOME/my-registry"
-# or a git repository
-export ILLUS_REGISTRY="https://github.com/example/registry.git"
-```
-
 ## Running the tests
 
 ```bash
@@ -103,7 +86,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-The integration tests run against a temporary `ILLUS_HOME` and a local
-registry, so they never touch your real `~/.local` and do not need network
-access. CI builds and tests on Linux (GCC and Clang) and macOS (Clang), plus a
+The integration tests run against a temporary `ILLUS_HOME`, so they never touch your real `~/.local`.
+Some cases may need network access for remote URL installs; core cases use local
+sources where possible. CI builds and tests on Linux (GCC and Clang) and macOS (Clang), plus a
 Linux ASan/UBSan job.
