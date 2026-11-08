@@ -1,3 +1,11 @@
+/*
+ * Darwin maps _XOPEN_SOURCE 700 to POSIX.1-2008, which is not enough for
+ * mkdtemp(); it is only declared at Darwin's full C level. Enable that level
+ * on Apple platforms while keeping strict POSIX declarations elsewhere.
+ */
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
