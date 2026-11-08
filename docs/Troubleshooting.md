@@ -1,6 +1,6 @@
 # Troubleshooting
 
-[Back to README](README.md)
+[Back to README](../README.md)
 
 - **`illus: command not found`** — add `~/.local/bin` to your `PATH`, for
   example `export PATH="$HOME/.local/bin:$PATH"`.

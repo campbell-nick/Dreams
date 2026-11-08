@@ -1,6 +1,6 @@
 # Warnings and safety
 
-[Back to README](README.md)
+[Back to README](../README.md)
 
 ## WARNING (Use at your own risk)
 

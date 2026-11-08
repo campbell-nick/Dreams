@@ -8,7 +8,7 @@ home directory, but package operations should not be run as root.
 
 > **Warning:** This project is still in development. You may face bugs or
 > issues. Please report them if you find any. Read
-> [Warnings and safety](Warnings.md) before installing anything.
+> [Warnings and safety](docs/Warnings.md) before installing anything.
 
 ## Features
 
@@ -46,7 +46,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 | Document | Contents |
 | --- | --- |
-| [Warnings and safety](Warnings.md) | Risk warning, safe-usage rules, known limitations |
-| [Installation](Installation.md) | Requirements, building/installing `illus`, removing it |
-| [Usage](Usage.md) | Paths, package tracking, all commands, exit status |
-| [Troubleshooting](Troubleshooting.md) | Common errors and fixes |
+| [Warnings and safety](docs/Warnings.md) | Risk warning, safe-usage rules, known limitations |
+| [Installation](docs/Installation.md) | Requirements, building/installing `illus`, removing it |
+| [Usage](docs/Usage.md) | Paths, package tracking, all commands, exit status |
+| [Troubleshooting](docs/Troubleshooting.md) | Common errors and fixes |
