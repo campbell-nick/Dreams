@@ -286,8 +286,12 @@ run "$BIN" pull "$REPO" --dir "$TMP/clone" --force --dry-run
 [ -f "$TMP/clone/file.txt" ] || fail "pull --force --dry-run changed the clone"
 run "$BIN" pull --dir "$TMP/clone2" -- "$REPO"
 [ -f "$TMP/clone2/file.txt" ] || fail "pull with -- did not clone"
-run "$BIN" pull "$REPO" --name custom-name
-[ -d "$DREAMS/custom-name" ] || fail "pull --name destination missing"
+PULLCWD="$TMP/pull-cwd"
+mkdir -p "$PULLCWD"
+run_in "$PULLCWD" "$BIN" pull "$REPO"
+[ -d "$PULLCWD/repo" ] || fail "pull default destination missing"
+run_in "$PULLCWD" "$BIN" pull "$REPO" --name custom-name
+[ -d "$PULLCWD/custom-name" ] || fail "pull --name destination missing"
 run "$BIN" pull "$REPO" --dir "$TMP/shallow" --depth 1
 [ -f "$TMP/shallow/file.txt" ] || fail "pull --depth did not clone"
 expect_status 1 "$BIN" pull -- -not-a-url

@@ -1907,6 +1907,9 @@ int cmd_pull(const illus_options *opts, const char *url) {
     char *home;
     char repo_name[256];
     char target[PATH_MAX];
+    char default_target[PATH_MAX];
+    illus_options pull_opts;
+    const illus_options *resolved_opts = opts;
     struct stat st;
 
     if (refuse_root("pull")) return 1;
@@ -1935,7 +1938,32 @@ int cmd_pull(const illus_options *opts, const char *url) {
         return 1;
     }
 
-    if (resolve_pull_target(opts, home, repo_name, target,
+    if (!opts->dir || !*opts->dir) {
+        /*
+         * Like `git clone`, default to a new directory named after the
+         * repository inside the current working directory. `install` keeps
+         * using ~/Dreams so its sources stay available for upgrades.
+         */
+        char cwd[PATH_MAX];
+
+        if (!getcwd(cwd, sizeof cwd)) {
+            fprintf(stderr,
+                    "[Dreams] Error: Could not determine current directory.\n");
+            free(home);
+            return 1;
+        }
+        if (path_join(default_target, sizeof default_target, cwd,
+                      repo_name) != 0) {
+            fprintf(stderr, "[Dreams] Error: destination path is too long.\n");
+            free(home);
+            return 1;
+        }
+        pull_opts = *opts;
+        pull_opts.dir = default_target;
+        resolved_opts = &pull_opts;
+    }
+
+    if (resolve_pull_target(resolved_opts, home, repo_name, target,
                             sizeof target) != 0) {
         free(home);
         return 1;
@@ -1982,7 +2010,8 @@ int cmd_pull(const illus_options *opts, const char *url) {
         return 0;
     }
 
-    if (clone_atomic(opts, url, target, opts->force, home, uid, gid) != 0) {
+    if (clone_atomic(resolved_opts, url, target, resolved_opts->force, home,
+                     uid, gid) != 0) {
         free(home);
         return 1;
     }

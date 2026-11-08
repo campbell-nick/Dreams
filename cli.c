@@ -450,7 +450,7 @@ void cli_print_help(const char *program, cli_command command) {
         printf("  list                 List installed packages\n");
         printf("  info <name>          Show details for an installed package\n");
         printf("  update               Pull, rebuild, and reinstall everything in ~/Dreams\n");
-        printf("  pull <url>           Clone a repository\n");
+        printf("  pull <url>           Clone a repository into the current directory\n");
         printf("  cast                 Build the current project\n");
         printf("  doctor               Diagnose common problems\n");
         printf("  version              Show version information\n");
@@ -530,7 +530,8 @@ void cli_print_help(const char *program, cli_command command) {
         break;
     case CLI_CMD_PULL:
         printf("Usage: %s pull <url> [options]\n\n", program);
-        printf("Clone a repository into ~/Dreams/<name> or an explicit destination.\n\n");
+        printf("Clone a git repository into ./<name> in the current directory, or\n");
+        printf("into an explicit destination with --dir.\n\n");
         printf("Options:\n");
         printf("  --dir <path>         Exact destination directory\n");
         printf("  --branch <ref>       Clone a specific branch or tag\n");

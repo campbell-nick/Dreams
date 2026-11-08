@@ -6,7 +6,8 @@
 
 | Path | Purpose |
 | --- | --- |
-| `~/Dreams/<repo>/` | Default source destination for `install` and `pull` |
+| `~/Dreams/<repo>/` | Default source destination for `install` |
+| `./<repo>/` | Default clone destination for `pull` (use `--dir` to override) |
 | `~/.local/` | Install prefix used by `cast --store` and `install` |
 | `~/.local/bin/` | Installed executables |
 | `~/.local/share/illus/<Package>.txt` | Manifest: metadata plus one installed path per line |
@@ -34,7 +35,7 @@ illus remove <name>...     Uninstall packages (aliases: shed, uninstall)
 illus list                 List installed packages
 illus info <name>          Show details for an installed package
 illus update               Pull, rebuild, and reinstall ~/Dreams projects
-illus pull <url>           Clone a git repository
+illus pull <url>           Clone a git repository into ./<name> in the CWD
 illus cast                 Build the current project
 illus doctor               Diagnose common problems
 illus version              Show version information
