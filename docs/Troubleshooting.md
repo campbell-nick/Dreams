@@ -75,11 +75,18 @@ staging directories, and untracked binaries.
 
 ## Leftover state
 
+`illus` cleans up its temporary directories when a fetch fails or is
+interrupted with Ctrl-C (`SIGINT`), `SIGTERM`, or `SIGHUP`. Entries below are
+left only after a hard kill (`SIGKILL`), power loss, or a crash. `illus doctor`
+reports stale staging and clone directories when it can see them.
+
 - `~/.local/.illus-stage-*` — temporary staging directories from a crash; safe
   to delete when no `illus` command is running.
-- `~/Dreams/.illus-clone-*` — temporary clone/download directories from an
-  interrupted fetch; safe to delete when no `illus` command is running.
-- `~/Dreams/.illus-old-*` — backup directories from an interrupted `--force`
+- `.illus-clone-*` — temporary clone/download directories from an interrupted
+  fetch. They are created next to the destination (for example `~/Dreams/` for
+  `install`, or the current directory for `pull`); safe to delete when no
+  `illus` command is running.
+- `.illus-old-*` — backup directories from an interrupted `--force`
   replacement. Check that the destination is correct before deleting one.
 
 ## See also

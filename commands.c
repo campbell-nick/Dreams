@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,17 @@
 
 static int g_verbose = 0;
 static const char *g_log_file = NULL;
+
+/*
+ * Set by the signal handler. Blocking calls are allowed to return EINTR so
+ * the normal error paths can stop the child and clean up temporary paths
+ * instead of dying mid-clone and leaving them behind.
+ */
+static volatile sig_atomic_t g_interrupt_signal = 0;
+
+static void handle_interrupt(int signo) {
+    g_interrupt_signal = signo;
+}
 
 static void print_command(char *const argv[]) {
     int i;
@@ -54,6 +66,23 @@ static void print_command_failure(char *const argv[], int status) {
     }
     if (argv && argv[i] != NULL) fprintf(stderr, " ...");
     fprintf(stderr, "\n");
+}
+
+/*
+ * Wait for a child. If the user interrupted us, forward a termination signal
+ * so a child that did not receive the terminal's SIGINT stops promptly.
+ */
+static int wait_for_child(pid_t pid, int *status) {
+    int forwarded = 0;
+
+    for (;;) {
+        if (waitpid(pid, status, 0) >= 0) return 0;
+        if (errno != EINTR) return -1;
+        if (g_interrupt_signal && !forwarded) {
+            kill(pid, SIGTERM);
+            forwarded = 1;
+        }
+    }
 }
 
 static int run_cmd(char *const argv[]) {
@@ -101,14 +130,19 @@ static int run_cmd(char *const argv[]) {
         close(pipefd[1]);
         char buf[4096];
         ssize_t n;
+        int interrupted = 0;
         while ((n = read(pipefd[0], buf, sizeof buf)) > 0) {
+            if (g_interrupt_signal && !interrupted) {
+                kill(pid, SIGTERM);
+                interrupted = 1;
+            }
             fwrite(buf, 1, (size_t)n, stdout);
             fwrite(buf, 1, (size_t)n, lf);
             fflush(stdout);
             fflush(lf);
         }
         close(pipefd[0]);
-        if (waitpid(pid, &status, 0) < 0) {
+        if (wait_for_child(pid, &status) < 0) {
             perror("[Dreams] Error: waitpid failed");
             fclose(lf);
             return -1;
@@ -138,7 +172,7 @@ static int run_cmd(char *const argv[]) {
         perror("[Dreams] Error: execvp failed");
         _exit(127);
     }
-    if (waitpid(pid, &status, 0) < 0) {
+    if (wait_for_child(pid, &status) < 0) {
         perror("[Dreams] Error: waitpid failed");
         return -1;
     }
@@ -626,6 +660,53 @@ static void remove_path(const char *path) {
     }
 }
 
+/*
+ * Temporary paths created during a fetch. They are normally removed by the
+ * fetch's error paths; this registry is a safety net so an interrupt cannot
+ * leave a half-written clone behind.
+ */
+#define MAX_TEMP_PATHS 16
+static char g_temp_paths[MAX_TEMP_PATHS][PATH_MAX];
+static int g_temp_path_count = 0;
+
+static void register_temp_path(const char *path) {
+    int i;
+
+    if (!path || !*path || strlen(path) >= PATH_MAX) return;
+    for (i = 0; i < g_temp_path_count; i++) {
+        if (strcmp(g_temp_paths[i], path) == 0) return;
+    }
+    if (g_temp_path_count >= MAX_TEMP_PATHS) return;
+    strcpy(g_temp_paths[g_temp_path_count++], path);
+}
+
+static void cleanup_temp_paths(void) {
+    while (g_temp_path_count > 0) {
+        g_temp_path_count--;
+        remove_directory(g_temp_paths[g_temp_path_count]);
+    }
+}
+
+/*
+ * Install handlers once per process. With no SA_RESTART, blocking waits and
+ * reads return EINTR, which lets the command unwind through its cleanup code.
+ */
+void illus_install_signal_handlers(void) {
+    static int installed = 0;
+    struct sigaction sa;
+
+    if (installed) return;
+    installed = 1;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = handle_interrupt;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    atexit(cleanup_temp_paths);
+}
+
 /* Recursive chown that never follows symlinks. */
 static void recursive_chown(const char *path, uid_t uid, gid_t gid) {
     struct stat st;
@@ -813,23 +894,30 @@ static int run_cmd_capture(char *const argv[], char *out, size_t out_size) {
         _exit(127);
     }
     close(fds[1]);
-    for (;;) {
-        char buf[512];
-        ssize_t n = read(fds[0], buf, sizeof buf);
+    {
+        int interrupted = 0;
+        for (;;) {
+            char buf[512];
+            ssize_t n = read(fds[0], buf, sizeof buf);
 
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        if (used + (size_t)n < out_size) {
-            memcpy(out + used, buf, (size_t)n);
-            used += (size_t)n;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0) break;
+            if (g_interrupt_signal && !interrupted) {
+                kill(pid, SIGTERM);
+                interrupted = 1;
+            }
+            if (used + (size_t)n < out_size) {
+                memcpy(out + used, buf, (size_t)n);
+                used += (size_t)n;
+            }
         }
     }
     close(fds[0]);
     out[used] = '\0';
-    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (wait_for_child(pid, &status) < 0) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
@@ -1603,26 +1691,29 @@ static int track_install(const char *home, const char *pkg_name, const char *sta
 /* Git helpers                                                               */
 /* ------------------------------------------------------------------------- */
 
-/* True when the optional cgc clone tool should be used for this URL. */
-static int cgc_preferred(const char *url, const illus_options *opts) {
-    if (!tool_available("cgc")) return 0;
-    if (!url || !*url) return 0;
+/*
+ * Return why cgc cannot handle this clone, or NULL when it can. Keeping the
+ * reason lets the caller report which clone tool is in use.
+ */
+static const char *cgc_skip_reason(const char *url, const illus_options *opts) {
+    if (!tool_available("cgc")) return "cgc is not on PATH";
+    if (!url || !*url) return "no URL";
     /* cgc cannot honor submodule recursion yet. */
     if (opts && opts->recursive) {
-        return 0;
+        return "cgc does not support --recursive";
     }
     /* Local filesystem paths must use git. */
     if (url[0] == '/' || url[0] == '~' ||
         strncmp(url, "./", 2) == 0 || strncmp(url, "../", 3) == 0) {
-        return 0;
+        return "local path";
     }
-    if (access(url, F_OK) == 0) return 0;
+    if (access(url, F_OK) == 0) return "local path";
     /* Transports cgc does not support. */
     if (strncmp(url, "ssh://", 6) == 0 || strncmp(url, "git://", 6) == 0) {
-        return 0;
+        return "cgc supports HTTPS only";
     }
-    if (strstr(url, "git@") != NULL) return 0;
-    return 1;
+    if (strstr(url, "git@") != NULL) return "cgc supports HTTPS only";
+    return NULL;
 }
 
 static int git_clone(const illus_options *opts, const char *url,
@@ -1630,12 +1721,14 @@ static int git_clone(const illus_options *opts, const char *url,
     char *argv[16];
     char depth[32];
     int n = 0;
+    const char *cgc_skip = cgc_skip_reason(url, opts);
 
-    if (cgc_preferred(url, opts)) {
+    if (!cgc_skip) {
         char *cargv[8];
         char depth_buf[32];
         int cn = 0;
 
+        printf("[Dreams] Clone tool: cgc\n");
         cargv[cn++] = "cgc";
         if (opts->branch && *opts->branch) {
             cargv[cn++] = "-b";
@@ -1656,6 +1749,7 @@ static int git_clone(const illus_options *opts, const char *url,
         return run_cmd(cargv);
     }
 
+    printf("[Dreams] Clone tool: git (%s)\n", cgc_skip);
     argv[n++] = "git";
     argv[n++] = "clone";
     if (opts->depth > 0) {
@@ -1769,11 +1863,21 @@ static int clone_atomic(const illus_options *opts, const char *url,
         perror("[Dreams] Error: could not create clone directory");
         return -1;
     }
+    register_temp_path(tmp);
 
     printf("[Dreams] Cloning into %s...\n", target);
     if (git_clone(opts, url, tmp) != 0) {
+        if (g_interrupt_signal) {
+            fprintf(stderr, "[Dreams] Interrupted; cleaning up clone directory.\n");
+        } else {
+            fprintf(stderr, "[Dreams] Error: clone failed.\n");
+        }
         remove_directory(tmp);
-        fprintf(stderr, "[Dreams] Error: git clone failed.\n");
+        return -1;
+    }
+    if (g_interrupt_signal) {
+        fprintf(stderr, "[Dreams] Interrupted; discarding clone.\n");
+        remove_directory(tmp);
         return -1;
     }
 
@@ -1818,6 +1922,7 @@ static int fetch_tarball_atomic(const char *url, const char *sha256,
         perror("[Dreams] Error: could not create download directory");
         return -1;
     }
+    register_temp_path(tmp);
     if (path_join(archive, sizeof archive, tmp, "source.archive") != 0 ||
         path_join(extract, sizeof extract, tmp, "src") != 0) {
         remove_directory(tmp);
@@ -1889,6 +1994,12 @@ static int fetch_tarball_atomic(const char *url, const char *sha256,
         }
     } else {
         copy_field(actual, sizeof actual, extract);
+    }
+
+    if (g_interrupt_signal) {
+        fprintf(stderr, "[Dreams] Interrupted; discarding download.\n");
+        remove_directory(tmp);
+        return -1;
     }
 
     if (swap_dir_into_place(actual, target, force, home, uid, gid) != 0) {
@@ -4057,6 +4168,21 @@ static void doctor_emit(doctor_state *state, const char *status,
     if (strcmp(status, "warn") == 0) state->warnings++;
 }
 
+/* Count directory entries whose names start with prefix. */
+static int count_prefixed_entries(const char *dir, const char *prefix) {
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+    size_t len = strlen(prefix);
+    int count = 0;
+
+    if (!d) return 0;
+    while ((entry = readdir(d)) != NULL) {
+        if (strncmp(entry->d_name, prefix, len) == 0) count++;
+    }
+    closedir(d);
+    return count;
+}
+
 int cmd_doctor(const illus_options *opts) {
     doctor_state state;
     char *home = NULL;
@@ -4269,6 +4395,30 @@ int cmd_doctor(const illus_options *opts) {
             doctor_emit(&state, "warn", "staging directories", buf);
         } else {
             doctor_emit(&state, "pass", "staging directories", "");
+        }
+    }
+
+    {
+        char dreams_dir[PATH_MAX];
+        char cwd[PATH_MAX];
+        int have_dreams;
+        int stale = 0;
+
+        have_dreams = path_join(dreams_dir, sizeof dreams_dir, home, "Dreams") == 0;
+        if (have_dreams) {
+            stale += count_prefixed_entries(dreams_dir, ".illus-clone-");
+        }
+        if (getcwd(cwd, sizeof cwd) &&
+            (!have_dreams || strcmp(cwd, dreams_dir) != 0)) {
+            stale += count_prefixed_entries(cwd, ".illus-clone-");
+        }
+        if (stale > 0) {
+            snprintf(buf, sizeof buf,
+                     "%d stale clone director%s (safe to delete when idle)",
+                     stale, stale == 1 ? "y" : "ies");
+            doctor_emit(&state, "warn", "clone directories", buf);
+        } else {
+            doctor_emit(&state, "pass", "clone directories", "");
         }
     }
 

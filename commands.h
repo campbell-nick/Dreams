@@ -37,6 +37,9 @@ typedef struct {
     const char *token;
 } illus_options;
 
+/* Install SIGINT/SIGTERM/SIGHUP handlers that allow graceful temp cleanup. */
+void illus_install_signal_handlers(void);
+
 int cmd_pull(const illus_options *opts, const char *url);
 int cmd_cast(const illus_options *opts);
 int cmd_install(const illus_options *opts, const char *spec);

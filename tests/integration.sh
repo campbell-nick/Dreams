@@ -302,6 +302,40 @@ ln -s /etc "$TMP/evil"
 run_fail "$BIN" pull "$REPO" --dir "$TMP/evil/illus-should-not-exist"
 [ ! -e /etc/illus-should-not-exist ] || fail "pull escaped through a symlink"
 
+echo "== interrupt cleanup =="
+# A fake cgc keeps the clone running so we can interrupt it deterministically.
+FAKEBIN="$TMP/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/cgc" <<'EOF'
+#!/bin/sh
+trap 'exit 130' INT TERM
+sleep 30
+EOF
+chmod +x "$FAKEBIN/cgc"
+INTDIR="$TMP/interrupt"
+mkdir -p "$INTDIR"
+PATH="$FAKEBIN:$PATH" "$BIN" pull https://example.invalid/interrupt.git \
+    --dir "$INTDIR/repo" >"$TMP/last.log" 2>&1 &
+pid=$!
+i=0
+while [ "$i" -lt 20 ] && ! has_entry "$INTDIR" ".illus-clone-*"; do
+    sleep 1
+    i=$((i + 1))
+done
+has_entry "$INTDIR" ".illus-clone-*" ||
+    fail "interrupt test: clone directory was not created"
+kill -TERM "$pid" 2>/dev/null || true
+wait "$pid" || true
+[ ! -e "$INTDIR/repo" ] || fail "interrupt test: destination was created"
+has_entry "$INTDIR" ".illus-clone-*" &&
+    fail "interrupt test: temporary clone directory was not cleaned up"
+
+mkdir -p "$DREAMS/.illus-clone-stale"
+run "$BIN" doctor
+grep -q "stale clone" "$TMP/last.log" ||
+    fail "doctor did not report stale clone directories"
+rmdir "$DREAMS/.illus-clone-stale"
+
 echo "== URL install/upgrade =="
 HELLO="$TMP/src/hello-git"
 make_package "$HELLO" hello

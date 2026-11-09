@@ -12,7 +12,7 @@
 | `~/.local/bin/` | Installed executables |
 | `~/.local/share/illus/<Package>.txt` | Manifest: metadata plus one installed path per line |
 | `~/.local/.illus-stage-*` | Temporary `DESTDIR` staging directories (removed automatically) |
-| `~/Dreams/.illus-clone-*` | Temporary clone/download directories used by atomic fetches |
+| `~/Dreams/.illus-clone-*` | Temporary clone/download directories used by atomic fetches (removed on failure or interrupt) |
 
 `illus` keeps no central database. The package name is the basename of the
 directory you run `cast --store` from (or the `--name` value), and the manifest
@@ -65,6 +65,15 @@ When cloning git sources, `illus` prefers
 [`cgc`](https://github.com/campbell-nick/CGC) (if available on `PATH`) for
 HTTPS URLs and falls back to `git clone` otherwise. `git` is still required for
 updating existing clones (`git pull --ff-only`) and for local/SSH transports.
+
+Every clone prints which tool is in use, including the fallback reason:
+
+```text
+[Dreams] Clone tool: cgc
+[Dreams] Clone tool: git (cgc is not on PATH)
+[Dreams] Clone tool: git (local path)
+[Dreams] Clone tool: git (cgc does not support --recursive)
+```
 
 - **Git sources**: if the destination already exists and is a git clone,
   `install` updates it (`git pull --ff-only`, or checks out the requested
@@ -220,8 +229,8 @@ illus doctor --verbose
 
 `doctor` checks the home directory, root status, `~/.local` ownership and
 permissions, `PATH`, required tools (`git`, `make`, `cmake`, `autoreconf`,
-`tar`), manifest integrity, unsafe entries, stale staging directories, and
-untracked binaries. It exits non-zero only when a check fails; warnings do not
+`tar`), manifest integrity, unsafe entries, stale staging and clone
+directories, and untracked binaries. It exits non-zero only when a check fails; warnings do not
 change the exit status.
 
 ## Environment variables

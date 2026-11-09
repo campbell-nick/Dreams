@@ -610,6 +610,8 @@ int cli_main(int argc, char *argv[]) {
         return 0;
     }
 
+    illus_install_signal_handlers();
+
     switch (parsed.command) {
     case CLI_CMD_VERSION:
         if (parsed.nargs != 0) {
