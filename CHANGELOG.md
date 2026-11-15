@@ -6,7 +6,7 @@ This project aims to follow [Semantic Versioning](https://semver.org/) for tagge
 
 ### Added
 - **Interrupt cleanup**: `SIGINT`/`SIGTERM`/`SIGHUP` now stop the running clone or download and remove its `.illus-clone-*` temporary directory instead of leaving it behind. `doctor` also reports stale clone directories in `~/Dreams` and the current directory.
-- **Clone tool indicator**: `pull` and `install` print `Clone tool: cgc` (or `Clone tool: git (<reason>)`) before cloning, so the active clone implementation is visible without `--verbose`.
+- **Clone/pull tool indicator**: `pull` and `install` print `Clone tool: cgc` (or `Clone tool: git (<reason>)`) before cloning, and update paths print `Pull tool: cgc` (or `Pull tool: git (<reason>)`), so the active implementation is visible without `--verbose`.
 - **`upgrade <package>`**: reinstalls an installed package using the source URL (and branch, when recorded) from its manifest. Supports `--dry-run`, `--reinstall`, build options, and `--sha256` for tarball sources.
 - **Meson/Ninja build support**: auto-detects `meson.build` (`--build-system=meson`), runs `meson setup/compile/install` with `--prefix` and `DESTDIR` staging.
 - Improved failure diagnostics: failed commands report exit status and command context; `--verbose` echoes commands.
@@ -15,7 +15,7 @@ This project aims to follow [Semantic Versioning](https://semver.org/) for tagge
 ### Changed
 - **URL-first installs**: `illus install` now takes a git or tarball URL/path. Tarball URLs require `--sha256`.
 - **`pull` default destination**: `illus pull <url>` now clones into `./<repo-name>` in the current directory (like `git clone`), instead of `~/Dreams/<repo>`. Use `--dir ~/Dreams/<name>` to restore the old behavior.
-- **Clone tool preference**: `illus` now prefers `cgc` (when available on `PATH`) for HTTPS clones, falling back to `git clone` otherwise. `git` is still required for updates (`git pull --ff-only`) and non-HTTP transports.
+- **Clone/pull tool preference**: `illus` now prefers `cgc` (when available on `PATH`) for HTTPS clones and fast-forward updates (`install`/`upgrade` and `update`), falling back to `git` otherwise. `git` is still required for local/SSH transports, shallow or SHA-256 repositories, and when `cgc` is absent.
 - `info` reports installed manifest details only.
 
 ### Removed

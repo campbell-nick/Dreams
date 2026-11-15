@@ -401,7 +401,34 @@ commit_all "$HELLO" "version three"
 run "$BIN" update
 grep -q "version-three" "$BINDIR/hello" ||
     fail "update did not rebuild the package"
+grep -q "Pull tool: git (local path)" "$TMP/last.log" ||
+    fail "update did not fall back to git for a local remote"
 run "$BIN" remove hello
+
+echo "== update prefers cgc for HTTPS remotes =="
+CGCBIN="$TMP/cgcbin"
+mkdir -p "$CGCBIN"
+cat > "$CGCBIN/cgc" <<'EOF'
+#!/bin/sh
+[ "$1" = pull ] || exit 2
+printf '%s\n' "$*" >> "$CGC_MARKER"
+exit 0
+EOF
+chmod +x "$CGCBIN/cgc"
+
+CGCREPO="$DREAMS/cgc-update"
+make_package "$CGCREPO" cgc-update
+init_repo "$CGCREPO"
+run git -C "$CGCREPO" remote add origin https://example.invalid/cgc-update.git
+commit_all "$CGCREPO" init
+: >"$TMP/cgc-marker"
+run env PATH="$CGCBIN:$PATH" CGC_MARKER="$TMP/cgc-marker" \
+    "$BIN" update --token test-token
+grep -q "Pull tool: cgc" "$TMP/last.log" ||
+    fail "update did not use cgc for an HTTPS remote"
+grep -q "pull --token test-token .*cgc-update" "$TMP/cgc-marker" ||
+    fail "update did not invoke cgc pull with the token"
+run "$BIN" remove cgc-update
 
 echo "== list --all and doctor =="
 printf '#!/bin/sh\ntrue\n' > "$BINDIR/untracked-tool"

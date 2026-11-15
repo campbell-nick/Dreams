@@ -63,20 +63,24 @@ and installs it with `DESTDIR` staging.
 
 When cloning git sources, `illus` prefers
 [`cgc`](https://github.com/campbell-nick/CGC) (if available on `PATH`) for
-HTTPS URLs and falls back to `git clone` otherwise. `git` is still required for
-updating existing clones (`git pull --ff-only`) and for local/SSH transports.
+HTTPS URLs and falls back to `git clone` otherwise. Updates use `cgc pull` for
+HTTPS remotes when possible, and fall back to `git pull --ff-only` for local/SSH
+transports, shallow or SHA-256 repositories, and when `cgc` is absent.
 
-Every clone prints which tool is in use, including the fallback reason:
+Every clone and pull prints which tool is in use, including the fallback
+reason:
 
 ```text
 [Dreams] Clone tool: cgc
 [Dreams] Clone tool: git (cgc is not on PATH)
 [Dreams] Clone tool: git (local path)
 [Dreams] Clone tool: git (cgc does not support --recursive)
+[Dreams] Pull tool: cgc
+[Dreams] Pull tool: git (local path)
 ```
 
 - **Git sources**: if the destination already exists and is a git clone,
-  `install` updates it (`git pull --ff-only`, or checks out the requested
+  `install` updates it (a fast-forward pull, or checks out the requested
   branch/tag) and rebuilds. This is the normal upgrade path.
 - **Tarball sources**: the archive is downloaded, its SHA-256 is verified, and
   it is extracted. Tarball URLs require `--sha256`. Reinstalling a tarball
@@ -99,7 +103,7 @@ Useful options:
 | `--configure-args <args>` | Extra arguments for `./configure` (Autotools) |
 | `--make-args <args>` | Extra arguments for `make` |
 | `--sha256 <hex>` | SHA-256 for a tarball URL install |
-| `--token <tok>` | Bearer token for private HTTPS repos (forwarded to cgc) |
+| `--token <tok>` | Bearer token for private HTTPS repos (forwarded to cgc for clone/pull) |
 | `--log-file <path>` | Tee command output to this file |
 | `--allow-untracked` | Accept an install that ignores `DESTDIR` |
 | `--dry-run` | Show what would happen without changing anything |
@@ -149,10 +153,11 @@ illus update --dry-run
 ```
 
 `update` pulls, rebuilds, and reinstalls every repository under `~/Dreams`
-that has a recognized build system. It is broader than `upgrade`: it operates
-on `~/Dreams` projects, not individual installed package manifests. `update`
-runs each project's build scripts, so only keep repositories you trust in
-`~/Dreams`.
+that has a recognized build system. It uses `cgc pull` for HTTPS remotes when
+`cgc` is available and `git pull --ff-only` otherwise. It is broader than
+`upgrade`: it operates on `~/Dreams` projects, not individual installed package
+manifests. `update` runs each project's build scripts, so only keep
+repositories you trust in `~/Dreams`.
 
 ## Listing and inspecting packages
 

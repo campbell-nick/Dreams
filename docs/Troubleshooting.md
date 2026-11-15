@@ -49,9 +49,10 @@ staging directories, and untracked binaries.
   updates an existing git clone instead.
 - **`destination exists but is not a git clone`** — `install` found a directory
   that it cannot update. Move it aside or pass `--force`.
-- **`could not update <path>`** — `git pull --ff-only` failed. The clone has
-  local changes or has diverged from the remote. Commit/stash/reset the clone,
-  or use `install --force` to replace it.
+- **`could not update <path>`** — the fast-forward pull failed (via `cgc pull`
+  or `git pull --ff-only`). The clone has local changes or has diverged from
+  the remote. Commit/stash/reset the clone, or use `install --force` to replace
+  it.
 - **`name-based install was removed; '<name>' is not a URL`** — `illus install`
   is URL-first. Pass a git or tarball URL, for example
   `illus install https://github.com/owner/repo.git`.

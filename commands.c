@@ -1692,16 +1692,11 @@ static int track_install(const char *home, const char *pkg_name, const char *sta
 /* ------------------------------------------------------------------------- */
 
 /*
- * Return why cgc cannot handle this clone, or NULL when it can. Keeping the
- * reason lets the caller report which clone tool is in use.
+ * Return why cgc cannot handle this URL, or NULL when it can. Shared by clone
+ * and pull so transport support stays in one place.
  */
-static const char *cgc_skip_reason(const char *url, const illus_options *opts) {
-    if (!tool_available("cgc")) return "cgc is not on PATH";
+static const char *cgc_url_skip_reason(const char *url) {
     if (!url || !*url) return "no URL";
-    /* cgc cannot honor submodule recursion yet. */
-    if (opts && opts->recursive) {
-        return "cgc does not support --recursive";
-    }
     /* Local filesystem paths must use git. */
     if (url[0] == '/' || url[0] == '~' ||
         strncmp(url, "./", 2) == 0 || strncmp(url, "../", 3) == 0) {
@@ -1714,6 +1709,19 @@ static const char *cgc_skip_reason(const char *url, const illus_options *opts) {
     }
     if (strstr(url, "git@") != NULL) return "cgc supports HTTPS only";
     return NULL;
+}
+
+/*
+ * Return why cgc cannot handle this clone, or NULL when it can. Keeping the
+ * reason lets the caller report which clone tool is in use.
+ */
+static const char *cgc_skip_reason(const char *url, const illus_options *opts) {
+    if (!tool_available("cgc")) return "cgc is not on PATH";
+    /* cgc cannot honor submodule recursion yet. */
+    if (opts && opts->recursive) {
+        return "cgc does not support --recursive";
+    }
+    return cgc_url_skip_reason(url);
 }
 
 static int git_clone(const illus_options *opts, const char *url,
@@ -1770,9 +1778,108 @@ static int git_clone(const illus_options *opts, const char *url,
     return run_cmd(argv);
 }
 
-static int git_pull_ff(const char *dir) {
-    char *argv[] = {"git", "-C", (char *)dir, "pull", "--ff-only", NULL};
-    return run_cmd(argv);
+/* Read a git config value, trimming the trailing newline. */
+static int git_config_get(const char *dir, const char *key, char *out,
+                          size_t out_size) {
+    char *argv[] = {
+        "git", "-C", (char *)dir, "config", "--get", (char *)key, NULL
+    };
+    size_t len;
+
+    if (run_cmd_capture(argv, out, out_size) != 0) return -1;
+    len = strcspn(out, "\r\n");
+    out[len] = '\0';
+    return out[0] ? 0 : -1;
+}
+
+static int git_current_branch(const char *dir, char *out, size_t out_size) {
+    char *argv[] = {
+        "git", "-C", (char *)dir, "symbolic-ref", "--short", "-q", "HEAD", NULL
+    };
+    size_t len;
+
+    if (run_cmd_capture(argv, out, out_size) != 0) return -1;
+    len = strcspn(out, "\r\n");
+    out[len] = '\0';
+    return out[0] ? 0 : -1;
+}
+
+/* Return the URL git would pull from, following the branch's remote setting. */
+static int git_remote_url(const char *dir, char *url, size_t url_size) {
+    char branch[256];
+    char remote[256];
+    char key[512];
+
+    if (git_current_branch(dir, branch, sizeof branch) != 0) return -1;
+    snprintf(key, sizeof key, "branch.%s.remote", branch);
+    if (git_config_get(dir, key, remote, sizeof remote) != 0) {
+        snprintf(remote, sizeof remote, "origin");
+    }
+    snprintf(key, sizeof key, "remote.%s.url", remote);
+    return git_config_get(dir, key, url, url_size);
+}
+
+static int git_is_shallow(const char *dir) {
+    char *argv[] = {
+        "git", "-C", (char *)dir, "rev-parse", "--is-shallow-repository", NULL
+    };
+    char out[16];
+
+    /* Older git versions do not know this option; assume not shallow. */
+    if (run_cmd_capture(argv, out, sizeof out) != 0) return 0;
+    return strncmp(out, "true", 4) == 0;
+}
+
+static int git_repo_uses_sha1(const char *dir) {
+    char format[64];
+
+    if (git_config_get(dir, "extensions.objectformat", format,
+                       sizeof format) != 0) {
+        return 1;
+    }
+    return strcmp(format, "sha256") != 0;
+}
+
+/*
+ * Return why cgc cannot pull in this repository, or NULL when it can. cgc
+ * reads the branch's configured remote and merge ref itself, so no extra
+ * arguments are needed.
+ */
+static const char *cgc_pull_skip_reason(const char *dir) {
+    char url[PATH_MAX];
+
+    if (!tool_available("cgc")) return "cgc is not on PATH";
+    if (git_is_shallow(dir)) return "shallow clone";
+    if (!git_repo_uses_sha1(dir)) return "SHA-256 repository";
+    if (git_remote_url(dir, url, sizeof url) != 0) {
+        return "could not determine remote URL";
+    }
+    return cgc_url_skip_reason(url);
+}
+
+static int git_pull_ff(const char *dir, const illus_options *opts) {
+    const char *cgc_skip = cgc_pull_skip_reason(dir);
+
+    if (!cgc_skip) {
+        char *argv[8];
+        int n = 0;
+
+        argv[n++] = "cgc";
+        argv[n++] = "pull";
+        if (opts && opts->token && *opts->token) {
+            argv[n++] = "--token";
+            argv[n++] = (char *)opts->token;
+        }
+        argv[n++] = (char *)dir;
+        argv[n] = NULL;
+        printf("[Dreams] Pull tool: cgc\n");
+        return run_cmd(argv);
+    }
+    {
+        char *argv[] = {"git", "-C", (char *)dir, "pull", "--ff-only", NULL};
+        printf("[Dreams] Pull tool: git (%s)\n", cgc_skip);
+        return run_cmd(argv);
+    }
 }
 
 /*
@@ -1780,7 +1887,8 @@ static int git_pull_ff(const char *dir) {
  * branch. Tags and raw commits end up detached, where "git pull" does not
  * apply; the checkout itself is the update in that case.
  */
-static int git_update_ref(const char *dir, const char *ref) {
+static int git_update_ref(const char *dir, const char *ref,
+                          const illus_options *opts) {
     char *fetch_argv[] = {
         "git", "-C", (char *)dir, "fetch", "--all", "--tags", NULL
     };
@@ -1791,7 +1899,7 @@ static int git_update_ref(const char *dir, const char *ref) {
         "git", "-C", (char *)dir, "symbolic-ref", "-q", "HEAD", NULL
     };
 
-    if (!ref || !*ref) return git_pull_ff(dir);
+    if (!ref || !*ref) return git_pull_ff(dir, opts);
     if (run_cmd(fetch_argv) != 0) {
         fprintf(stderr, "[Dreams] Error: could not fetch updates for %s.\n", dir);
         return -1;
@@ -1802,7 +1910,7 @@ static int git_update_ref(const char *dir, const char *ref) {
     }
     /* symbolic-ref exits non-zero for a detached HEAD (tag or commit). */
     if (run_cmd(symbolic_argv) != 0) return 0;
-    return git_pull_ff(dir);
+    return git_pull_ff(dir, opts);
 }
 
 /* Move a prepared directory into place, replacing an existing one on request. */
@@ -3054,12 +3162,12 @@ int cmd_install(const illus_options *opts, const char *spec) {
                     printf("[Dreams] Dry run: would check out '%s' and update %s\n",
                            branch, target);
                 } else {
-                    printf("[Dreams] Dry run: would update %s with git pull --ff-only\n",
+                    printf("[Dreams] Dry run: would update %s (fast-forward only)\n",
                            target);
                 }
             } else {
                 printf("[Dreams] Updating %s...\n", target);
-                if (git_update_ref(target, branch) != 0) {
+                if (git_update_ref(target, branch, opts) != 0) {
                     fprintf(stderr, "[Dreams] Error: could not update %s.\n",
                             target);
                     free(home);
@@ -3330,16 +3438,11 @@ int cmd_update(const illus_options *opts) {
         }
 
         printf("[Dreams] Updating project: %s\n", entry->d_name);
-        {
-            char *const pull_argv[] = {
-                "git", "-C", repo_path, "pull", "--ff-only", NULL
-            };
-            if (run_cmd(pull_argv) != 0) {
-                fprintf(stderr, "[Dreams] Error: 'git pull' failed for %s.\n",
-                        entry->d_name);
-                failures++;
-                continue;
-            }
+        if (git_pull_ff(repo_path, opts) != 0) {
+            fprintf(stderr, "[Dreams] Error: could not pull updates for %s.\n",
+                    entry->d_name);
+            failures++;
+            continue;
         }
 
         if (path_join(cmake_path, sizeof cmake_path, repo_path,
@@ -4323,7 +4426,7 @@ int cmd_doctor(const illus_options *opts) {
 
         if (find_in_path("cgc", path, sizeof path) == 0) {
             doctor_emit(&state, "pass", "cgc available",
-                        "preferred clone tool (HTTPS)");
+                        "preferred clone/pull tool (HTTPS)");
         } else {
             doctor_emit(&state, "info", "cgc available",
                         "optional; git is used when absent");
